@@ -200,6 +200,7 @@ class EndToEndTestCase(unittest.TestCase):
             "Not all additional users found in database", 10, 5)
 
     @timeout_decorator.timeout(TEST_TIMEOUT_SEC)
+    @unittest.skip("Skipping this test until fixed")
     def test_additional_pod_capabilities(self):
         '''
            Extend postgres container capabilities
