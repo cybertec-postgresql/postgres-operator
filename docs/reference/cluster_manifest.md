@@ -118,7 +118,7 @@ These parameters are grouped directly under  the `spec` key in the manifest.
   a map of usernames to user flags for the users that should be created in the
   cluster by the operator. User flags are a list, allowed elements are
   `SUPERUSER`, `REPLICATION`, `INHERIT`, `LOGIN`, `NOLOGIN`, `CREATEROLE`,
-  `CREATEDB`, `BYPASSURL`. A login user is created by default unless NOLOGIN is
+  `CREATEDB`, `BYPASSRLS`. A login user is created by default unless NOLOGIN is
   specified, in which case the operator creates a role. One can specify empty
   flags by providing a JSON empty array '*[]*'. If the config option
   `enable_cross_namespace_secret` is enabled you can specify the namespace in
@@ -334,7 +334,9 @@ explanation of `ttl` and `loop_wait` parameters.
   Patroni `synchronous_node_count` parameter value. Note, this option is only available for Spilo images with Patroni 2.0+. The default is set to `1`. Optional.
 
 * **failsafe_mode**
-  Patroni `failsafe_mode` parameter value. If enabled, allows Patroni to cope with DCS outages and avoid leader demotion. Note, this option is currently not included in any Patroni release. The default is set to `false`. Optional.
+  Patroni `failsafe_mode` parameter value. If enabled, allows Patroni to cope with DCS outages and avoid leader demotion. See the Patroni documentation
+  [here](https://patroni.readthedocs.io/en/master/dcs_failsafe_mode.html) for more details. This feature is included since Patroni 3.0.0. 
+  Hence, check the container image in use if this feature is included in the used Patroni version. The default is set to `false`. Optional.
   
 ## Postgres container resources
 

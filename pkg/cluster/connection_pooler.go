@@ -348,20 +348,33 @@ func (c *Cluster) generateConnectionPoolerPodTemplate(role PostgresRole) (
 		// Env vars
 		crtFile := spec.TLS.CertificateFile
 		keyFile := spec.TLS.PrivateKeyFile
+		caFile := spec.TLS.CAFile
+		mountPath := "/tls"
+		mountPathCA := mountPath
+
 		if crtFile == "" {
 			crtFile = "tls.crt"
 		}
 		if keyFile == "" {
-			crtFile = "tls.key"
+			keyFile = "tls.key"
+		}
+		if caFile == "" {
+			caFile = "ca.crt"
+		}
+		if spec.TLS.CASecretName != "" {
+			mountPathCA = mountPath + "ca"
 		}
 
 		envVars = append(
 			envVars,
 			v1.EnvVar{
-				Name: "CONNECTION_POOLER_CLIENT_TLS_CRT", Value: filepath.Join("/tls", crtFile),
+				Name: "CONNECTION_POOLER_CLIENT_TLS_CRT", Value: filepath.Join(mountPath, crtFile),
 			},
 			v1.EnvVar{
-				Name: "CONNECTION_POOLER_CLIENT_TLS_KEY", Value: filepath.Join("/tls", keyFile),
+				Name: "CONNECTION_POOLER_CLIENT_TLS_KEY", Value: filepath.Join(mountPath, keyFile),
+			},
+			v1.EnvVar{
+				Name: "CONNECTION_POOLER_CLIENT_CA_FILE", Value: filepath.Join(mountPathCA, caFile),
 			},
 		)
 
@@ -387,6 +400,7 @@ func (c *Cluster) generateConnectionPoolerPodTemplate(role PostgresRole) (
 
 	poolerContainer.Env = envVars
 	tolerationsSpec := tolerations(&spec.Tolerations, c.OpConfig.PodToleration)
+	topologySpreadConstraintsSpec := topologySpreadConstraints(&spec.TopologySpreadConstraints)
 
 	podTemplate := &v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -398,8 +412,15 @@ func (c *Cluster) generateConnectionPoolerPodTemplate(role PostgresRole) (
 			TerminationGracePeriodSeconds: &gracePeriod,
 			Containers:                    []v1.Container{poolerContainer},
 			Tolerations:                   tolerationsSpec,
+			TopologySpreadConstraints:     topologySpreadConstraintsSpec,
 			Volumes:                       poolerVolumes,
 		},
+	}
+
+	if spec.TLS != nil && spec.TLS.SecretName != "" && spec.SpiloFSGroup != nil {
+		podTemplate.Spec.SecurityContext = &v1.PodSecurityContext{
+			FSGroup: spec.SpiloFSGroup,
+		}
 	}
 
 	nodeAffinity := c.nodeAffinity(c.OpConfig.NodeReadinessLabel, spec.NodeAffinity)

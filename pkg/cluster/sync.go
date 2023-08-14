@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"reflect"
@@ -64,6 +65,11 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		return err
 	}
 
+	if err = c.syncPgbackrestConfig(); err != nil {
+		err = fmt.Errorf("could not sync pgbackrest config: %v", err)
+		return err
+	}
+
 	// sync volume may already transition volumes to gp3, if iops/throughput or type is specified
 	if err = c.syncVolumes(); err != nil {
 		return err
@@ -97,6 +103,22 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		if err = c.syncLogicalBackupJob(); err != nil {
 			err = fmt.Errorf("could not sync the logical backup job: %v", err)
 			return err
+		}
+	}
+
+	if c.Spec.Backup != nil && c.Spec.Backup.Pgbackrest != nil {
+
+		c.logger.Debug("syncing pgbackrest jobs")
+		if err = c.syncPgbackrestJob(false); err != nil {
+			err = fmt.Errorf("could not sync the pgbackrest jobs: %v", err)
+			return err
+		}
+		if c.Postgresql.Spec.Backup.Pgbackrest.Restore.ID != c.Status.PgbackrestRestoreID {
+			if err = c.syncPgbackrestRestoreConfig(); err != nil {
+				return err
+			}
+			c.KubeClient.SetPgbackrestRestoreCRDStatus(c.clusterName(), c.Postgresql.Spec.Backup.Pgbackrest.Restore.ID)
+			c.logger.Info("a pgbackrest restore config has been successfully synced")
 		}
 	}
 
@@ -413,6 +435,7 @@ func (c *Cluster) syncStatefulSet() error {
 	}
 
 	// sync Patroni config
+	c.logger.Debug("syncing Patroni config")
 	if configPatched, restartPrimaryFirst, restartWait, err = c.syncPatroniConfig(pods, c.Spec.Patroni, requiredPgParameters); err != nil {
 		c.logger.Warningf("Patroni config updated? %v - errors during config sync: %v", configPatched, err)
 		isSafeToRecreatePods = false
@@ -641,18 +664,18 @@ func (c *Cluster) checkAndSetGlobalPostgreSQLConfiguration(pod *v1.Pod, effectiv
 	}
 	// check if specified slots exist in config and if they differ
 	for slotName, desiredSlot := range desiredPatroniConfig.Slots {
-		if effectiveSlot, exists := effectivePatroniConfig.Slots[slotName]; exists {
-			if reflect.DeepEqual(desiredSlot, effectiveSlot) {
-				continue
-			}
-		}
-		slotsToSet[slotName] = desiredSlot
 		// only add slots specified in manifest to c.replicationSlots
 		for manifestSlotName, _ := range c.Spec.Patroni.Slots {
 			if manifestSlotName == slotName {
 				c.replicationSlots[slotName] = desiredSlot
 			}
 		}
+		if effectiveSlot, exists := effectivePatroniConfig.Slots[slotName]; exists {
+			if reflect.DeepEqual(desiredSlot, effectiveSlot) {
+				continue
+			}
+		}
+		slotsToSet[slotName] = desiredSlot
 	}
 	if len(slotsToSet) > 0 {
 		configToSet["slots"] = slotsToSet
@@ -1050,7 +1073,7 @@ DBUSERS:
 
 func (c *Cluster) syncDatabases() error {
 	c.setProcessName("syncing databases")
-
+	errors := make([]string, 0)
 	createDatabases := make(map[string]string)
 	alterOwnerDatabases := make(map[string]string)
 	preparedDatabases := make([]string, 0)
@@ -1096,12 +1119,12 @@ func (c *Cluster) syncDatabases() error {
 
 	for databaseName, owner := range createDatabases {
 		if err = c.executeCreateDatabase(databaseName, owner); err != nil {
-			return err
+			errors = append(errors, err.Error())
 		}
 	}
 	for databaseName, owner := range alterOwnerDatabases {
 		if err = c.executeAlterDatabaseOwner(databaseName, owner); err != nil {
-			return err
+			errors = append(errors, err.Error())
 		}
 	}
 
@@ -1117,14 +1140,19 @@ func (c *Cluster) syncDatabases() error {
 	// set default privileges for prepared database
 	for _, preparedDatabase := range preparedDatabases {
 		if err := c.initDbConnWithName(preparedDatabase); err != nil {
-			return fmt.Errorf("could not init database connection to %s", preparedDatabase)
+			errors = append(errors, fmt.Sprintf("could not init database connection to %s", preparedDatabase))
+			continue
 		}
 
 		for _, owner := range c.getOwnerRoles(preparedDatabase, c.Spec.PreparedDatabases[preparedDatabase].DefaultUsers) {
 			if err = c.execAlterGlobalDefaultPrivileges(owner, preparedDatabase); err != nil {
-				return err
+				errors = append(errors, err.Error())
 			}
 		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("error(s) while syncing databases: %v", strings.Join(errors, `', '`))
 	}
 
 	return nil
@@ -1132,9 +1160,12 @@ func (c *Cluster) syncDatabases() error {
 
 func (c *Cluster) syncPreparedDatabases() error {
 	c.setProcessName("syncing prepared databases")
+	errors := make([]string, 0)
+
 	for preparedDbName, preparedDB := range c.Spec.PreparedDatabases {
 		if err := c.initDbConnWithName(preparedDbName); err != nil {
-			return fmt.Errorf("could not init connection to database %s: %v", preparedDbName, err)
+			errors = append(errors, fmt.Sprintf("could not init connection to database %s: %v", preparedDbName, err))
+			continue
 		}
 
 		c.logger.Debugf("syncing prepared database %q", preparedDbName)
@@ -1144,12 +1175,13 @@ func (c *Cluster) syncPreparedDatabases() error {
 			preparedSchemas = map[string]acidv1.PreparedSchema{"data": {DefaultRoles: util.True()}}
 		}
 		if err := c.syncPreparedSchemas(preparedDbName, preparedSchemas); err != nil {
-			return err
+			errors = append(errors, err.Error())
+			continue
 		}
 
 		// install extensions
 		if err := c.syncExtensions(preparedDB.Extensions); err != nil {
-			return err
+			errors = append(errors, err.Error())
 		}
 
 		if err := c.closeDbConn(); err != nil {
@@ -1157,11 +1189,16 @@ func (c *Cluster) syncPreparedDatabases() error {
 		}
 	}
 
+	if len(errors) > 0 {
+		return fmt.Errorf("error(s) while syncing prepared databases: %v", strings.Join(errors, `', '`))
+	}
+
 	return nil
 }
 
 func (c *Cluster) syncPreparedSchemas(databaseName string, preparedSchemas map[string]acidv1.PreparedSchema) error {
 	c.setProcessName("syncing prepared schemas")
+	errors := make([]string, 0)
 
 	currentSchemas, err := c.getSchemas()
 	if err != nil {
@@ -1184,9 +1221,13 @@ func (c *Cluster) syncPreparedSchemas(databaseName string, preparedSchemas map[s
 				owner = dbOwner
 			}
 			if err = c.executeCreateDatabaseSchema(databaseName, schemaName, dbOwner, owner); err != nil {
-				return err
+				errors = append(errors, err.Error())
 			}
 		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("error(s) while syncing schemas of prepared databases: %v", strings.Join(errors, `', '`))
 	}
 
 	return nil
@@ -1194,7 +1235,7 @@ func (c *Cluster) syncPreparedSchemas(databaseName string, preparedSchemas map[s
 
 func (c *Cluster) syncExtensions(extensions map[string]string) error {
 	c.setProcessName("syncing database extensions")
-
+	errors := make([]string, 0)
 	createExtensions := make(map[string]string)
 	alterExtensions := make(map[string]string)
 
@@ -1214,13 +1255,17 @@ func (c *Cluster) syncExtensions(extensions map[string]string) error {
 
 	for extName, schema := range createExtensions {
 		if err = c.executeCreateExtension(extName, schema); err != nil {
-			return err
+			errors = append(errors, err.Error())
 		}
 	}
 	for extName, schema := range alterExtensions {
 		if err = c.executeAlterExtension(extName, schema); err != nil {
-			return err
+			errors = append(errors, err.Error())
 		}
+	}
+
+	if len(errors) > 0 {
+		return fmt.Errorf("error(s) while syncing database extensions: %v", strings.Join(errors, `', '`))
 	}
 
 	return nil
@@ -1274,6 +1319,98 @@ func (c *Cluster) syncLogicalBackupJob() error {
 		if _, err = c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(context.TODO(), jobName, metav1.GetOptions{}); err != nil {
 			return fmt.Errorf("could not fetch existing logical backup job: %v", err)
 		}
+	}
+	return nil
+}
+
+func (c *Cluster) syncPgbackrestConfig() error {
+	if cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), c.getPgbackrestConfigmapName(), metav1.GetOptions{}); err == nil {
+		if err := c.updatePgbackrestConfig(cm); err != nil {
+			return fmt.Errorf("could not update a pgbackrest config: %v", err)
+		}
+		c.logger.Info("a pgbackrest config has been successfully updated")
+	} else {
+		if err := c.createPgbackrestConfig(); err != nil {
+			return fmt.Errorf("could not create a pgbackrest config: %v", err)
+		}
+		c.logger.Info("a pgbackrest config has been successfully created")
+	}
+	return nil
+}
+
+func (c *Cluster) syncPgbackrestRestoreConfig() error {
+	if cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), c.getPgbackrestRestoreConfigmapName(), metav1.GetOptions{}); err == nil {
+		if err := c.updatePgbackrestRestoreConfig(cm); err != nil {
+			return fmt.Errorf("could not update a pgbackrest restore config: %v", err)
+		}
+		c.logger.Info("a pgbackrest restore config has been successfully updated")
+	} else {
+		if err := c.createPgbackrestRestoreConfig(); err != nil {
+			return fmt.Errorf("could not create a pgbackrest restore config: %v", err)
+		}
+		c.logger.Info("a pgbackrest restore config has been successfully created")
+	}
+	return nil
+}
+
+func (c *Cluster) syncPgbackrestJob(forceRemove bool) error {
+	repos := []string{"repo1", "repo2", "repo3", "repo4"}
+	schedules := []string{"full", "incr", "diff"}
+	for _, rep := range repos {
+		for _, schedul := range schedules {
+			remove := true
+			if !forceRemove && len(c.Postgresql.Spec.Backup.Pgbackrest.Repos) >= 1 {
+				for _, repo := range c.Postgresql.Spec.Backup.Pgbackrest.Repos {
+					for name, schedule := range repo.Schedule {
+						c.logger.Info(fmt.Sprintf("%s %s:%s %s", rep, schedul, repo.Name, name))
+						if rep == repo.Name && name == schedul {
+							remove = false
+							if cj, err := c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Get(context.TODO(), c.getPgbackrestJobName(repo.Name, name), metav1.GetOptions{}); err == nil {
+								if err := c.patchPgbackrestJob(cj, repo.Name, name, schedule); err != nil {
+									return fmt.Errorf("could not update a pgbackrest cronjob: %v", err)
+								}
+								c.logger.Info("a pgbackrest cronjob has been successfully updated")
+							} else {
+								if err := c.createPgbackrestJob(repo.Name, name, schedule); err != nil {
+									return fmt.Errorf("could not create a pgbackrest cronjob: %v", err)
+								}
+								c.logger.Info("a pgbackrest cronjob has been successfully created")
+							}
+						}
+					}
+				}
+			}
+			if remove {
+				c.deletePgbackrestJob(rep, schedul)
+				c.logger.Info("a pgbackrest cronjob has been successfully deleted")
+			}
+		}
+	}
+	return nil
+}
+
+func (c *Cluster) createTDESecret() error {
+	c.logger.Info("creating TDE secret")
+	c.setProcessName("creating TDE secret")
+	generatedKey := make([]byte, 16)
+	rand.Read(generatedKey)
+
+	generatedSecret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      c.getTDESecretName(),
+			Namespace: c.Namespace,
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			"key": []byte(fmt.Sprintf("%x", generatedKey)),
+		},
+	}
+	secret, err := c.KubeClient.Secrets(generatedSecret.Namespace).Create(context.TODO(), &generatedSecret, metav1.CreateOptions{})
+	if err == nil {
+		c.Secrets[secret.UID] = secret
+		c.logger.Debugf("created new secret %s, namespace: %s, uid: %s", util.NameFromMeta(secret.ObjectMeta), generatedSecret.Namespace, secret.UID)
+	} else {
+		return fmt.Errorf("could not create secret for TDE %s: in namespace %s: %v", util.NameFromMeta(secret.ObjectMeta), generatedSecret.Namespace, err)
 	}
 
 	return nil
