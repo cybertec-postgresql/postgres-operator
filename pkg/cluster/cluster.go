@@ -1221,6 +1221,8 @@ func (c *Cluster) Delete() error {
 	defer c.mu.Unlock()
 	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Delete", "Started deletion of cluster resources")
 
+	isRestoreInPlace := c.Annotations["postgres-operator.zalando.org/action"] == "restore-in-place"
+	c.logger.Debugf("restore-in-place: Deleting the cluster, verifying whether resotore-in-place is true or not: %+v\n", isRestoreInPlace)
 	if err := c.deleteStreams(); err != nil {
 		anyErrors = true
 		c.logger.Warningf("could not delete event streams: %v", err)
@@ -1241,7 +1243,7 @@ func (c *Cluster) Delete() error {
 		c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete statefulset: %v", err)
 	}
 
-	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion {
+	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion && !isRestoreInPlace {
 		if err := c.deleteSecrets(); err != nil {
 			anyErrors = true
 			c.logger.Warningf("could not delete secrets: %v", err)
@@ -1266,10 +1268,12 @@ func (c *Cluster) Delete() error {
 			}
 		}
 
-		if err := c.deleteService(role); err != nil {
-			anyErrors = true
-			c.logger.Warningf("could not delete %s service: %v", role, err)
-			c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+		if !isRestoreInPlace {
+			if err := c.deleteService(role); err != nil {
+				anyErrors = true
+				c.logger.Warningf("could not delete %s service: %v", role, err)
+				c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+			}
 		}
 	}
 
