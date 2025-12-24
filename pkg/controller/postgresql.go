@@ -14,7 +14,9 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/cache"
 
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
@@ -539,6 +541,13 @@ func (c *Controller) postgresqlUpdate(prev, cur interface{}) {
 	pgOld := c.postgresqlCheck(prev)
 	pgNew := c.postgresqlCheck(cur)
 	if pgOld != nil && pgNew != nil {
+
+		if pgNew.Annotations["postgres-operator.zalando.org/action"] == "restore-in-place" {
+			c.logger.Debugf("restore-in-place: postgresqlUpdate called for cluster %q", pgNew.Name)
+			c.handlerRestoreInPlace(pgOld, pgNew)
+			return
+		}
+
 		// Avoid the inifinite recursion for status updates
 		if reflect.DeepEqual(pgOld.Spec, pgNew.Spec) {
 			if reflect.DeepEqual(pgNew.Annotations, pgOld.Annotations) {
@@ -566,6 +575,146 @@ func (c *Controller) postgresqlCheck(obj interface{}) *acidv1.Postgresql {
 		return nil
 	}
 	return pg
+}
+
+// validateRestoreInPlace checks if the restore parameters are valid
+func (c *Controller) validateRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) error {
+	c.logger.Debugf("restore-in-place: validating restore parameters for cluster %q", pgNew.Name)
+
+	if pgNew.Spec.Clone == nil {
+		return fmt.Errorf("'clone' section is missing in the manifest")
+	}
+
+	// Use ClusterName from CloneDescription
+	if pgNew.Spec.Clone.ClusterName != pgOld.Name {
+		return fmt.Errorf("clone cluster name %q does not match the current cluster name %q", pgNew.Spec.Clone.ClusterName, pgOld.Name)
+	}
+
+	// Use EndTimestamp from CloneDescription
+	cloneTimestamp, err := time.Parse(time.RFC3339, pgNew.Spec.Clone.EndTimestamp)
+	if err != nil {
+		return fmt.Errorf("could not parse clone timestamp %q: %v", pgNew.Spec.Clone.EndTimestamp, err)
+	}
+
+	if cloneTimestamp.After(time.Now()) {
+		return fmt.Errorf("clone timestamp %q is in the future", pgNew.Spec.Clone.EndTimestamp)
+	}
+
+	c.logger.Debugf("restore-in-place: validation successful")
+	return nil
+}
+
+// waitForOldResourcesTermination waits until the postgresql CR and its StatefulSet are terminated
+func (c *Controller) waitForOldResourcesTermination(pgOld *acidv1.Postgresql, statefulSetName string) error {
+	c.logger.Debugf("restore-in-place: Waiting for old CR %q and StatefulSet %q to be fully terminated", pgOld.Name, statefulSetName)
+
+	err := wait.PollUntilContextTimeout(context.TODO(), 2*time.Second, 5*time.Minute, true, func(ctx context.Context) (bool, error) {
+		// Check for CR
+		_, crErr := c.KubeClient.AcidV1ClientSet.AcidV1().Postgresqls(pgOld.Namespace).Get(ctx, pgOld.Name, metav1.GetOptions{})
+		crGone := errors.IsNotFound(crErr)
+		if crErr != nil && !crGone {
+			c.logger.Errorf("restore-in-place: Error while waiting for CR deletion: %v", crErr)
+			return false, crErr // A real error occurred
+		}
+
+		// Check for StatefulSet
+		_, stsErr := c.KubeClient.StatefulSets(pgOld.Namespace).Get(ctx, statefulSetName, metav1.GetOptions{})
+		stsGone := errors.IsNotFound(stsErr)
+		if stsErr != nil && !stsGone {
+			c.logger.Errorf("restore-in-place: Error while waiting for StatefulSet deletion: %v", stsErr)
+			return false, stsErr // A real error occurred
+		}
+
+		if crGone && stsGone {
+			c.logger.Debugf("restore-in-place: Both old CR and StatefulSet are fully terminated.")
+			return true, nil
+		}
+
+		if !crGone {
+			c.logger.Infof("restore-in-place: still waiting for postgresql CR %q to be deleted", pgOld.Name)
+		}
+		if !stsGone {
+			c.logger.Infof("restore-in-place: still waiting for StatefulSet %q to be deleted", statefulSetName)
+		}
+
+		return false, nil // Not done yet, continue polling.
+	})
+
+	if err != nil {
+		return fmt.Errorf("error while waiting for old resources to be deleted: %v", err)
+	}
+
+	c.logger.Debugf("restore-in-place: Finished waiting for old resource deletion.")
+	return nil
+}
+
+// handlerRestoreInPlace is to handle the resotre in place, it does few operatons
+// 1. Verifies the parameters required for restoring in place
+// 2. Removes the old CR if it exists, wait for it, if not present check the err that it is a k8sNotfound error and continue
+// 3. Wait for the successful removal of statefulsets, if not present check the err that it is a k8sNotfound error and continue
+// 4. Create a new CR with the latest details, while keeping few metadata about restore
+func (c *Controller) handlerRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
+	c.logger.Infof("restore-in-place: starting restore-in-place for cluster %q", pgNew.Name)
+
+	if err := c.validateRestoreInPlace(pgOld, pgNew); err != nil {
+		c.logger.Errorf("restore-in-place: validation failed for cluster %q: %v", pgNew.Name, err)
+		return
+	}
+
+	newPgSpec := pgNew.DeepCopy()
+	delete(newPgSpec.Annotations, "postgres-operator.zalando.org/action")
+	newPgSpec.ResourceVersion = ""
+	newPgSpec.UID = ""
+	c.logger.Debugf("restore-in-place: newPgSpec after removing annotation: %+v", newPgSpec)
+
+	statefulSetName := pgOld.Name // Capture StatefulSet name, it's the same as the cluster name
+
+	// Initiate CR deletion first, as requested
+	c.logger.Debugf("restore-in-place: Attempting direct API deletion of postgresql CR %q", pgOld.Name)
+	err := c.KubeClient.AcidV1ClientSet.AcidV1().Postgresqls(pgOld.Namespace).Delete(context.TODO(), pgOld.Name, metav1.DeleteOptions{})
+	if err != nil && !errors.IsNotFound(err) {
+		c.logger.Errorf("restore-in-place: could not delete postgresql CR via API: %v", err)
+		return // Stop if there's a critical error deleting the CR
+	}
+	c.logger.Debugf("restore-in-place: Direct API deletion of postgresql CR for %q initiated (or CR was already not found).", pgOld.Name)
+
+	// Then, initiate cluster sub-resource deletion if the cluster object is in memory
+	clusterName := util.NameFromMeta(pgOld.ObjectMeta)
+	c.clustersMu.RLock()
+	cl, clusterFound := c.clusters[clusterName]
+	c.clustersMu.RUnlock()
+
+	if clusterFound {
+		c.logger.Debugf("restore-in-place: Cluster object found in memory. Calling cluster.Delete() for %q", clusterName)
+		if cl.Annotations == nil {
+			cl.Annotations = make(map[string]string)
+		}
+		cl.Annotations["postgres-operator.zalando.org/action"] = "restore-in-place" // User requested to keep this
+		if err := cl.Delete(); err != nil {
+			// Log error but continue to ensure we wait for termination
+			c.logger.Errorf("restore-in-place: error during cluster.Delete() for %q: %v. Proceeding to wait for termination.", clusterName, err)
+		}
+		c.logger.Debugf("restore-in-place: cluster.Delete() returned for %q", clusterName)
+	} else {
+		c.logger.Warningf("restore-in-place: cluster %q not found in controller's map. Relying on CR deletion to trigger cleanup.", clusterName)
+	}
+
+	if err := c.waitForOldResourcesTermination(pgOld, statefulSetName); err != nil {
+		c.logger.Errorf("restore-in-place: %v", err)
+		return
+	}
+
+	// Create a new CR with the latest details
+	c.logger.Debugf("restore-in-place: Creating new postgresql CR %q", newPgSpec.Name)
+	_, err = c.KubeClient.AcidV1ClientSet.AcidV1().Postgresqls(newPgSpec.Namespace).Create(context.TODO(), newPgSpec, metav1.CreateOptions{})
+	if err != nil {
+		c.logger.Errorf("restore-in-place: could not create postgresql CR for restore-in-place: %v", err)
+		// If the new CR cannot be created, the user needs to intervene.
+		return
+	}
+	c.logger.Debugf("restore-in-place: New postgresql CR %q created", newPgSpec.Name)
+
+	c.logger.Infof("restore-in-place: for cluster %q triggered successfully", pgNew.Name)
 }
 
 /*
