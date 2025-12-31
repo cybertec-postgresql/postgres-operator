@@ -693,17 +693,25 @@ func (c *Controller) handlerRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
 	c.logger.Infof("restore-in-place: initiated deletion of postgresql CR %q", pgOld.Name)
 }
 
-// processPendingRestores handles the re-creation part of the asynchronous point-in-time-restore.
-// It is called periodically and checks for ConfigMaps that signal a pending or in-progress restore.
 func (c *Controller) processPendingRestores() error {
 	c.logger.Debug("restore-in-place: checking for pending restores")
-
 	namespace := c.opConfig.WatchedNamespace
 	if namespace == "" {
 		namespace = v1.NamespaceAll
 	}
 
-	// Process "pending" restores: wait for deletion and move to "in-progress"
+	if err := c.processPendingCm(namespace); err != nil {
+		return err
+	}
+
+	if err := c.processInProgressCm(namespace); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (c *Controller) processPendingCm(namespace string) error {
 	pendingOpts := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", cluster.PitrStateLabelKey, cluster.PitrStateLabelValuePending)}
 	pendingCmList, err := c.KubeClient.ConfigMaps(namespace).List(context.TODO(), pendingOpts)
 	if err != nil {
@@ -714,27 +722,35 @@ func (c *Controller) processPendingRestores() error {
 	}
 
 	for _, cm := range pendingCmList.Items {
-		c.logger.Debugf("restore-in-place: processing pending ConfigMap %q", cm.Name)
-		clusterName := strings.TrimPrefix(cm.Name, "pitr-state-")
-
-		_, err := c.KubeClient.Postgresqls(cm.Namespace).Get(context.TODO(), clusterName, metav1.GetOptions{})
-		if err == nil {
-			c.logger.Infof("restore-in-place: pending restore for cluster %q is waiting for old Postgresql CR to be deleted", clusterName)
-			continue
-		}
-		if !errors.IsNotFound(err) {
-			c.logger.Errorf("restore-in-place: could not check for existence of Postgresql CR %q: %v", clusterName, err)
-			continue
-		}
-
-		c.logger.Infof("restore-in-place: old Postgresql CR %q is deleted, moving restore to 'in-progress'", clusterName)
-		cm.Labels[cluster.PitrStateLabelKey] = cluster.PitrStateLabelValueInProgress
-		if _, err := c.KubeClient.ConfigMaps(cm.Namespace).Update(context.TODO(), &cm, metav1.UpdateOptions{}); err != nil {
-			c.logger.Errorf("restore-in-place: could not update ConfigMap %q to 'in-progress': %v", cm.Name, err)
+		if err := c.processSinglePendingCm(cm); err != nil {
+			c.logger.Errorf("restore-in-place: could not process pending restore for config map %s: %v", cm.Name, err)
 		}
 	}
+	return nil
+}
 
-	// Process "in-progress" restores: re-create the CR and clean up
+func (c *Controller) processSinglePendingCm(cm v1.ConfigMap) error {
+	c.logger.Debugf("restore-in-place: processing pending ConfigMap %q", cm.Name)
+	clusterName := strings.TrimPrefix(cm.Name, "pitr-state-")
+
+	_, err := c.KubeClient.Postgresqls(cm.Namespace).Get(context.TODO(), clusterName, metav1.GetOptions{})
+	if err == nil {
+		c.logger.Infof("restore-in-place: pending restore for cluster %q is waiting for old Postgresql CR to be deleted", clusterName)
+		return nil
+	}
+	if !errors.IsNotFound(err) {
+		return fmt.Errorf("could not check for existence of Postgresql CR %q: %v", clusterName, err)
+	}
+
+	c.logger.Infof("restore-in-place: old Postgresql CR %q is deleted, moving restore to 'in-progress'", clusterName)
+	cm.Labels[cluster.PitrStateLabelKey] = cluster.PitrStateLabelValueInProgress
+	if _, err := c.KubeClient.ConfigMaps(cm.Namespace).Update(context.TODO(), &cm, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("could not update ConfigMap %q to 'in-progress': %v", cm.Name, err)
+	}
+	return nil
+}
+
+func (c *Controller) processInProgressCm(namespace string) error {
 	inProgressOpts := metav1.ListOptions{LabelSelector: fmt.Sprintf("%s=%s", cluster.PitrStateLabelKey, cluster.PitrStateLabelValueInProgress)}
 	inProgressCmList, err := c.KubeClient.ConfigMaps(namespace).List(context.TODO(), inProgressOpts)
 	if err != nil {
@@ -745,33 +761,33 @@ func (c *Controller) processPendingRestores() error {
 	}
 
 	for _, cm := range inProgressCmList.Items {
-		c.logger.Infof("restore-in-place: processing in-progress restore for ConfigMap %q", cm.Name)
-
-		c.logger.Debugf("restore-in-place: unmarshalling spec from ConfigMap %q", cm.Name)
-		var newPgSpec acidv1.Postgresql
-		if err := json.Unmarshal([]byte(cm.Data[cluster.PitrSpecDataKey]), &newPgSpec); err != nil {
-			c.logger.Errorf("restore-in-place: could not unmarshal postgresql spec from ConfigMap %q: %v", cm.Name, err)
-			continue
+		if err := c.processSingleInProgressCm(cm); err != nil {
+			c.logger.Errorf("restore-in-place: could not process in-progress restore for config map %s: %v", cm.Name, err)
 		}
+	}
+	return nil
+}
 
-		c.logger.Debugf("restore-in-place: creating new Postgresql CR %q from ConfigMap spec", newPgSpec.Name)
-		_, err := c.KubeClient.Postgresqls(newPgSpec.Namespace).Create(context.TODO(), &newPgSpec, metav1.CreateOptions{})
-		if err != nil {
-			if errors.IsAlreadyExists(err) {
-				c.logger.Infof("restore-in-place: Postgresql CR %q already exists, cleaning up restore ConfigMap", newPgSpec.Name)
-				// fallthrough to delete
-			} else {
-				c.logger.Errorf("restore-in-place: could not re-create Postgresql CR %q for restore: %v", newPgSpec.Name, err)
-				continue // Retry on next cycle
-			}
+func (c *Controller) processSingleInProgressCm(cm v1.ConfigMap) error {
+	c.logger.Infof("restore-in-place: processing in-progress restore for ConfigMap %q", cm.Name)
+
+	c.logger.Debugf("restore-in-place: unmarshalling spec from ConfigMap %q", cm.Name)
+	var newPgSpec acidv1.Postgresql
+	if err := json.Unmarshal([]byte(cm.Data[cluster.PitrSpecDataKey]), &newPgSpec); err != nil {
+		return fmt.Errorf("could not unmarshal postgresql spec from ConfigMap %q: %v", cm.Name, err)
+	}
+
+	c.logger.Debugf("restore-in-place: creating new Postgresql CR %q from ConfigMap spec", newPgSpec.Name)
+	_, err := c.KubeClient.Postgresqls(newPgSpec.Namespace).Create(context.TODO(), &newPgSpec, metav1.CreateOptions{})
+	if err != nil {
+		if errors.IsAlreadyExists(err) {
+			c.logger.Infof("restore-in-place: Postgresql CR %q already exists, cleaning up restore ConfigMap", newPgSpec.Name)
+			// fallthrough to delete
 		} else {
-			c.logger.Infof("restore-in-place: successfully re-created Postgresql CR %q to complete restore", newPgSpec.Name)
+			return fmt.Errorf("could not re-create Postgresql CR %q for restore: %v", newPgSpec.Name, err)
 		}
-
-		// c.logger.Debugf("restore-in-place: deleting successfully used restore ConfigMap %q", cm.Name)
-		// if err := c.KubeClient.ConfigMaps(cm.Namespace).Delete(context.TODO(), cm.Name, metav1.DeleteOptions{}); err != nil {
-		// 	c.logger.Errorf("restore-in-place: could not delete state ConfigMap %q: %v", cm.Name, err)
-		// }
+	} else {
+		c.logger.Infof("restore-in-place: successfully re-created Postgresql CR %q to complete restore", newPgSpec.Name)
 	}
 
 	return nil

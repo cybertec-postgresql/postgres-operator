@@ -438,27 +438,27 @@ func (c *Cluster) Create() (err error) {
 	}
 
 
-	if err := c.updatePITRResources(); err != nil {
+	if err := c.updatePITRResources(PitrStateLabelValueFinished); err != nil {
 		return fmt.Errorf("could not update pitr resources: %v", err)
 	}
 	return nil
 }
 
 // update the label to finished for PITR for the given config map
-func (c *Cluster) updatePITRResources() error {
+func (c *Cluster) updatePITRResources(state string) error {
 	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
 	cmNamespace := c.Namespace
 	patchPayload := map[string]any{
 		"metadata": map[string]any{
 			"labels": map[string]string{
-				PitrStateLabelKey: PitrStateLabelValueFinished,
+				PitrStateLabelKey: state,
 			},
 		},
 	}
 
 	data, _ := json.Marshal(patchPayload)
 	if _, err := c.KubeClient.ConfigMaps(cmNamespace).Patch(context.TODO(), cmName, types.MergePatchType, data, metav1.PatchOptions{}, ""); err != nil {
-		c.logger.Errorf("restore-in-place: error updating config map label to final state: %v", err)
+		c.logger.Errorf("restore-in-place: error updating config map label to state: %v", err)
 		return err
 	}
 	return nil
@@ -1236,13 +1236,31 @@ func syncResources(a, b *v1.ResourceRequirements) bool {
 }
 
 const (
-	PitrStateLabelKey         = "postgres-operator.zalando.org/pitr-state"
+	PitrStateLabelKey             = "postgres-operator.zalando.org/pitr-state"
 	PitrStateLabelValuePending    = "pending"
 	PitrStateLabelValueInProgress = "in-progress"
-	PitrStateLabelValueFinished = "finished"
-	PitrConfigMapNameTemplate = "pitr-state-%s"
-	PitrSpecDataKey           = "spec"
+	PitrStateLabelValueFinished   = "finished"
+	PitrConfigMapNameTemplate     = "pitr-state-%s"
+	PitrSpecDataKey               = "spec"
 )
+
+func (c *Cluster) isRestoreInPlace() bool {
+	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
+	cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), cmName, metav1.GetOptions{})
+	if err != nil {
+		c.logger.Debugf("restore-in-place: Error while fetching config map: %s before deletion", cmName)
+		return false
+	}
+
+	if cm != nil {
+		if val, ok := cm.Labels[PitrStateLabelKey]; ok {
+			if val == PitrStateLabelValuePending {
+				return true
+			}
+		}
+	}
+	return false
+}
 
 // Delete deletes the cluster and cleans up all objects associated with it (including statefulsets).
 // The deletion order here is somewhat significant, because Patroni, when running with the Kubernetes
@@ -1255,23 +1273,7 @@ func (c *Cluster) Delete() error {
 	defer c.mu.Unlock()
 	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Delete", "Started deletion of cluster resources")
 
-
-	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
-
-	isRestoreInPlace := false
-	cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), cmName, metav1.GetOptions{})
-	if err != nil {
-		c.logger.Debugf("restore-in-place: Error while fetching config map: %s before deletion", cmName)
-	}
-
-	if cm != nil {
-		if val, ok := cm.Labels[PitrStateLabelKey]; ok {
-			if val == PitrStateLabelValuePending {
-				isRestoreInPlace = true
-			}
-		}
-	}
-
+	isRestoreInPlace := c.isRestoreInPlace()
 	c.logger.Debugf("restore-in-place: Deleting the cluster, verifying whether resotore-in-place is true or not: %+v\n", isRestoreInPlace)
 	if err := c.deleteStreams(); err != nil {
 		anyErrors = true
