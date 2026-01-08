@@ -113,6 +113,9 @@ spec:
               repair_period:
                 type: string
                 default: "5m"
+              pitr_backup_retention:
+                type: string
+                default: "168h"
               set_memory_request_to_limit:
                 type: boolean
                 default: false

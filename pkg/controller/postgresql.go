@@ -13,8 +13,8 @@ import (
 	"github.com/sirupsen/logrus"
 
 	v1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/cache"
 
@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	restoreAnnotationKey      = "postgres-operator.zalando.org/action"
-	restoreAnnotationValue    = "restore-in-place"
+	restoreAnnotationKey   = "postgres-operator.zalando.org/action"
+	restoreAnnotationValue = "restore-in-place"
 )
 
 func (c *Controller) clusterResync(stopCh <-chan struct{}, wg *sync.WaitGroup) {
@@ -43,6 +43,9 @@ func (c *Controller) clusterResync(stopCh <-chan struct{}, wg *sync.WaitGroup) {
 			}
 			if err := c.processPendingRestores(); err != nil {
 				c.logger.Errorf("could not process pending restores: %v", err)
+			}
+			if err := c.cleanupRestores(); err != nil {
+				c.logger.Errorf("could not cleanup restores: %v", err)
 			}
 		case <-stopCh:
 			return
@@ -611,8 +614,6 @@ func (c *Controller) validateRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) err
 	return nil
 }
 
-
-
 // handlerRestoreInPlace starts an asynchronous point-in-time-restore.
 // It creates a ConfigMap to store the state and then deletes the old Postgresql CR.
 func (c *Controller) handlerRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
@@ -775,6 +776,44 @@ func (c *Controller) processSingleInProgressCm(cm v1.ConfigMap) error {
 		}
 	} else {
 		c.logger.Infof("restore-in-place: successfully re-created Postgresql CR %q to complete restore", newPgSpec.Name)
+	}
+
+	return nil
+}
+
+func (c *Controller) cleanupRestores() error {
+	c.logger.Debug("cleaning up old restore config maps")
+	namespace := c.opConfig.WatchedNamespace
+	if namespace == "" {
+		namespace = v1.NamespaceAll
+	}
+
+	cmList, err := c.KubeClient.ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return fmt.Errorf("could not list restore ConfigMaps: %v", err)
+	}
+
+	retention := c.opConfig.PitrBackupRetention
+	if retention <= 0 {
+		c.logger.Debugf("Pitr backup retention is not set, skipping cleanup")
+		return nil
+	}
+	c.logger.Debugf("Pitr backup retention is %s", retention.String())
+
+	for _, cm := range cmList.Items {
+		if !strings.HasPrefix(cm.Name, "pitr-") {
+			continue
+		}
+
+		age := time.Since(cm.CreationTimestamp.Time)
+		if age > retention {
+			c.logger.Infof("deleting old restore config map %q, age: %s", cm.Name, age.String())
+			err := c.KubeClient.ConfigMaps(cm.Namespace).Delete(context.TODO(), cm.Name, metav1.DeleteOptions{})
+			if err != nil {
+				c.logger.Errorf("could not delete config map %q: %v", cm.Name, err)
+				// continue with next cm
+			}
+		}
 	}
 
 	return nil
