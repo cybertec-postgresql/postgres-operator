@@ -48,6 +48,10 @@ Those parameters are grouped under the `metadata` top-level key.
   Labels that are set here but not listed as `inherited_labels` in the operator
   parameters are ignored.
 
+* **annotations**
+  A map of annotations to add to the `postgresql` resource. The operator reacts to certain annotations, for instance, to trigger specific actions.
+  * `postgres-operator.zalando.org/action: restore-in-place`: When this annotation is present with this value, the operator will trigger an automated in-place restore of the cluster. This process requires a valid `clone` section to be defined in the manifest with a target `timestamp`. See the [user guide](../user.md#automated-restore-in-place-point-in-time-recovery) for more details.
+
 ## Top-level parameters
 
 These parameters are grouped directly under  the `spec` key in the manifest.

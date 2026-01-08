@@ -172,7 +172,7 @@ Those are top-level keys, containing both leaf keys and groups.
   period between consecutive repair requests. The default is `5m`.
 
 * **pitr_backup_retention**
-  retention time for PITR backup config maps. The operator will clean up config maps older than the configured retention. The value is a duration string, e.g. "168h". The default is `168h`.
+  retention time for PITR (Point-In-Time-Recovery) state ConfigMaps. The operator will clean up ConfigMaps older than the configured retention. The value is a [duration string](https://pkg.go.dev/time#ParseDuration), e.g. "168h" (which is 7 days), "7d", "24h". The default is `168h`.
 
 * **set_memory_request_to_limit**
   Set `memory_request` to `memory_limit` for all Postgres clusters (the default
