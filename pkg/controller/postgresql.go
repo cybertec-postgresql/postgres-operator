@@ -554,7 +554,7 @@ func (c *Controller) postgresqlUpdate(prev, cur interface{}) {
 
 		if pgNew.Annotations[restoreAnnotationKey] == restoreAnnotationValue {
 			c.logger.Debugf("restore-in-place: postgresqlUpdate called for cluster %q", pgNew.Name)
-			c.handlerRestoreInPlace(pgOld, pgNew)
+			c.handleRestoreInPlace(pgOld, pgNew)
 			return
 		}
 
@@ -614,9 +614,9 @@ func (c *Controller) validateRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) err
 	return nil
 }
 
-// handlerRestoreInPlace starts an asynchronous point-in-time-restore.
+// handleRestoreInPlace starts an asynchronous point-in-time-restore.
 // It creates a ConfigMap to store the state and then deletes the old Postgresql CR.
-func (c *Controller) handlerRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
+func (c *Controller) handleRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
 	c.logger.Infof("restore-in-place: starting asynchronous restore-in-place for cluster %q", pgNew.Name)
 
 	if err := c.validateRestoreInPlace(pgOld, pgNew); err != nil {
@@ -675,7 +675,6 @@ func (c *Controller) handlerRestoreInPlace(pgOld, pgNew *acidv1.Postgresql) {
 	err = c.KubeClient.Postgresqls(pgOld.Namespace).Delete(context.TODO(), pgOld.Name, metav1.DeleteOptions{})
 	if err != nil && !errors.IsNotFound(err) {
 		c.logger.Errorf("restore-in-place: could not delete postgresql CR %q: %v", pgOld.Name, err)
-		// Consider deleting the ConfigMap here to allow a retry
 		return
 	}
 	c.logger.Infof("restore-in-place: initiated deletion of postgresql CR %q", pgOld.Name)
@@ -745,7 +744,7 @@ func (c *Controller) processInProgressCm(namespace string) error {
 		return fmt.Errorf("restore-in-place: could not list in-progress restore ConfigMaps: %v", err)
 	}
 	if len(inProgressCmList.Items) > 0 {
-		c.logger.Debugf("restore-in-place: found %d in-progress restore(s) to process", len(inProgressCmList.Items))
+		c.logger.Infof("restore-in-place: found %d in-progress restore(s) to process", len(inProgressCmList.Items))
 	}
 
 	for _, cm := range inProgressCmList.Items {
@@ -770,14 +769,13 @@ func (c *Controller) processSingleInProgressCm(cm v1.ConfigMap) error {
 	if err != nil {
 		if errors.IsAlreadyExists(err) {
 			c.logger.Infof("restore-in-place: Postgresql CR %q already exists, cleaning up restore ConfigMap", newPgSpec.Name)
-			// fallthrough to delete
+			return nil
 		} else {
 			return fmt.Errorf("could not re-create Postgresql CR %q for restore: %v", newPgSpec.Name, err)
 		}
-	} else {
-		c.logger.Infof("restore-in-place: successfully re-created Postgresql CR %q to complete restore", newPgSpec.Name)
 	}
-
+	// If err is nil (creation successful)
+	c.logger.Infof("restore-in-place: successfully re-created Postgresql CR %q to complete restore", newPgSpec.Name)
 	return nil
 }
 
@@ -801,7 +799,7 @@ func (c *Controller) cleanupRestores() error {
 	c.logger.Debugf("Pitr backup retention is %s", retention.String())
 
 	for _, cm := range cmList.Items {
-		if !strings.HasPrefix(cm.Name, "pitr-") {
+		if !strings.HasPrefix(cm.Name, "pitr-state-") {
 			continue
 		}
 
