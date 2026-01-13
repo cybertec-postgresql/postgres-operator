@@ -33,6 +33,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -432,7 +433,6 @@ func (c *Cluster) Create() (err error) {
 		c.logger.Errorf("could not list resources: %v", err)
 	}
 
-
 	if err := c.updatePITRResources(PitrStateLabelValueFinished); err != nil {
 		return fmt.Errorf("could not update pitr resources: %v", err)
 	}
@@ -453,6 +453,10 @@ func (c *Cluster) updatePITRResources(state string) error {
 
 	data, _ := json.Marshal(patchPayload)
 	if _, err := c.KubeClient.ConfigMaps(cmNamespace).Patch(context.TODO(), cmName, types.MergePatchType, data, metav1.PatchOptions{}, ""); err != nil {
+		// If ConfigMap doesn't exist, this is a normal cluster creation (not a restore-in-place)
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
 		c.logger.Errorf("restore-in-place: error updating config map label to state: %v", err)
 		return err
 	}

@@ -24,7 +24,9 @@ import (
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
+	k8stesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/record"
 )
 
@@ -94,6 +96,7 @@ func TestCreate(t *testing.T) {
 	clusterNamespace := "test"
 
 	client := k8sutil.KubernetesClient{
+		ConfigMapsGetter:             clientSet.CoreV1(),
 		DeploymentsGetter:            clientSet.AppsV1(),
 		CronJobsGetter:               clientSet.BatchV1(),
 		EndpointsGetter:              clientSet.CoreV1(),
@@ -2198,6 +2201,123 @@ func TestGetSwitchoverSchedule(t *testing.T) {
 			schedule := cluster.GetSwitchoverSchedule()
 			if schedule != tt.expected {
 				t.Errorf("Expected GetSwitchoverSchedule to return %s, returned: %s", tt.expected, schedule)
+			}
+		})
+	}
+}
+
+func TestUpdatePITRResources(t *testing.T) {
+	clusterName := "test-cluster"
+	clusterNamespace := "default"
+
+	tests := []struct {
+		name          string
+		state         string
+		cmExists      bool
+		patchFails    bool
+		expectedErr   bool
+		expectedLabel string
+	}{
+		{
+			"successful patch - update label to finished",
+			PitrStateLabelValueFinished,
+			true,
+			false,
+			false,
+			PitrStateLabelValueFinished,
+		},
+		{
+			"successful patch - update label to in-progress",
+			PitrStateLabelValueInProgress,
+			true,
+			false,
+			false,
+			PitrStateLabelValueInProgress,
+		},
+		{
+			"config map does not exist - no error",
+			PitrStateLabelValueFinished,
+			false,
+			false,
+			false,
+			"",
+		},
+		{
+			"patch fails with non-NotFound error",
+			PitrStateLabelValueFinished,
+			true,
+			true,
+			true,
+			"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientSet := fake.NewSimpleClientset()
+			acidClientSet := fakeacidv1.NewSimpleClientset()
+
+			if tt.cmExists {
+				cmName := fmt.Sprintf(PitrConfigMapNameTemplate, clusterName)
+				cm := &v1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      cmName,
+						Namespace: clusterNamespace,
+						Labels: map[string]string{
+							PitrStateLabelKey: PitrStateLabelValuePending,
+						},
+					},
+				}
+				_, err := clientSet.CoreV1().ConfigMaps(clusterNamespace).Create(context.TODO(), cm, metav1.CreateOptions{})
+				if err != nil {
+					t.Fatalf("could not create configmap: %v", err)
+				}
+			}
+
+			if tt.patchFails {
+				clientSet.PrependReactor("patch", "configmaps", func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
+					return true, nil, fmt.Errorf("synthetic patch error")
+				})
+			}
+
+			client := k8sutil.KubernetesClient{
+				ConfigMapsGetter:  clientSet.CoreV1(),
+				PostgresqlsGetter: acidClientSet.AcidV1(),
+			}
+
+			pg := acidv1.Postgresql{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      clusterName,
+					Namespace: clusterNamespace,
+				},
+			}
+
+			cluster := New(
+				Config{
+					OpConfig: config.Config{
+						PodManagementPolicy: "ordered_ready",
+					},
+				}, client, pg, logger, eventRecorder)
+
+			err := cluster.updatePITRResources(tt.state)
+
+			if err != nil {
+				if !tt.expectedErr {
+					t.Fatalf("unexpected error: %v", err)
+				}
+			} else if tt.expectedErr {
+				t.Fatalf("expected error, but got none")
+			}
+
+			if tt.cmExists && !tt.patchFails && tt.expectedLabel != "" {
+				cmName := fmt.Sprintf(PitrConfigMapNameTemplate, clusterName)
+				updatedCm, err := clientSet.CoreV1().ConfigMaps(clusterNamespace).Get(context.TODO(), cmName, metav1.GetOptions{})
+				if err != nil {
+					t.Fatalf("could not get configmap: %v", err)
+				}
+				if updatedCm.Labels[PitrStateLabelKey] != tt.expectedLabel {
+					t.Errorf("expected label %q but got %q", tt.expectedLabel, updatedCm.Labels[PitrStateLabelKey])
+				}
 			}
 		})
 	}
