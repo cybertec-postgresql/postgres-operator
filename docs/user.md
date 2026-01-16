@@ -107,7 +107,7 @@ kind: postgresql
 metadata:
   name: acid-minimal-cluster
 spec:
-  [...] 
+  [...]
   postgresql:
     version: "17"
     parameters:
