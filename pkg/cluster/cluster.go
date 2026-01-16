@@ -3,6 +3,7 @@ package cluster
 // Postgres CustomResourceDefinition object i.e. Spilo
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -432,6 +434,33 @@ func (c *Cluster) Create() (err error) {
 		c.logger.Errorf("could not list resources: %v", err)
 	}
 
+	if err := c.updatePITRResources(PitrStateLabelValueFinished); err != nil {
+		return fmt.Errorf("could not update pitr resources: %v", err)
+	}
+	return nil
+}
+
+// update the label to finished for PITR for the given config map
+func (c *Cluster) updatePITRResources(state string) error {
+	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
+	cmNamespace := c.Namespace
+	patchPayload := map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]string{
+				PitrStateLabelKey: state,
+			},
+		},
+	}
+
+	data, _ := json.Marshal(patchPayload)
+	if _, err := c.KubeClient.ConfigMaps(cmNamespace).Patch(context.TODO(), cmName, types.MergePatchType, data, metav1.PatchOptions{}, ""); err != nil {
+		// If ConfigMap doesn't exist, this is a normal cluster creation (not a restore-in-place)
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		c.logger.Errorf("restore-in-place: error updating config map label to state: %v", err)
+		return err
+	}
 	return nil
 }
 
@@ -1202,6 +1231,33 @@ func syncResources(a, b *v1.ResourceRequirements) bool {
 	return false
 }
 
+const (
+	PitrStateLabelKey             = "postgres-operator.zalando.org/pitr-state"
+	PitrStateLabelValuePending    = "pending"
+	PitrStateLabelValueInProgress = "in-progress"
+	PitrStateLabelValueFinished   = "finished"
+	PitrConfigMapNameTemplate     = "pitr-state-%s"
+	PitrSpecDataKey               = "spec"
+)
+
+func (c *Cluster) isRestoreInPlace() bool {
+	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
+	cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), cmName, metav1.GetOptions{})
+	if err != nil {
+		c.logger.Debugf("restore-in-place: Error while fetching config map: %s before deletion", cmName)
+		return false
+	}
+
+	if cm != nil {
+		if val, ok := cm.Labels[PitrStateLabelKey]; ok {
+			if val == PitrStateLabelValuePending {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Delete deletes the cluster and cleans up all objects associated with it (including statefulsets).
 // The deletion order here is somewhat significant, because Patroni, when running with the Kubernetes
 // DCS, reuses the master's endpoint to store the leader related metadata. If we remove the endpoint
@@ -1213,6 +1269,8 @@ func (c *Cluster) Delete() error {
 	defer c.mu.Unlock()
 	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Delete", "Started deletion of cluster resources")
 
+	isRestoreInPlace := c.isRestoreInPlace()
+	c.logger.Debugf("restore-in-place: Deleting the cluster, verifying whether resotore-in-place is true or not: %+v\n", isRestoreInPlace)
 	if err := c.deleteStreams(); err != nil {
 		anyErrors = true
 		c.logger.Warningf("could not delete event streams: %v", err)
@@ -1233,7 +1291,7 @@ func (c *Cluster) Delete() error {
 		c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete statefulset: %v", err)
 	}
 
-	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion {
+	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion && !isRestoreInPlace {
 		if err := c.deleteSecrets(); err != nil {
 			anyErrors = true
 			c.logger.Warningf("could not delete secrets: %v", err)
@@ -1258,10 +1316,12 @@ func (c *Cluster) Delete() error {
 			}
 		}
 
-		if err := c.deleteService(role); err != nil {
-			anyErrors = true
-			c.logger.Warningf("could not delete %s service: %v", role, err)
-			c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+		if !isRestoreInPlace {
+			if err := c.deleteService(role); err != nil {
+				anyErrors = true
+				c.logger.Warningf("could not delete %s service: %v", role, err)
+				c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+			}
 		}
 	}
 

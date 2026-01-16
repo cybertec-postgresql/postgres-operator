@@ -20,6 +20,7 @@ configuration:
   min_instances: -1
   resync_period: 30m
   repair_period: 5m
+  pitr_backup_retention: 168h
   # set_memory_request_to_limit: false
   # sidecars:
   # - image: image:123

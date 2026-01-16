@@ -266,6 +266,7 @@ type OperatorConfigurationData struct {
 	Workers                       uint32                             `json:"workers,omitempty"`
 	ResyncPeriod                  Duration                           `json:"resync_period,omitempty"`
 	RepairPeriod                  Duration                           `json:"repair_period,omitempty"`
+	PitrBackupRetention           Duration                           `json:"pitr_backup_retention,omitempty"`
 	SetMemoryRequestToLimit       bool                               `json:"set_memory_request_to_limit,omitempty"`
 	ShmVolume                     *bool                              `json:"enable_shm_volume,omitempty"`
 	SidecarImages                 map[string]string                  `json:"sidecar_docker_images,omitempty"` // deprecated in favour of SidecarContainers

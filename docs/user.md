@@ -891,6 +891,45 @@ original UID, making it possible retry restoring. However, it is probably
 better to create a temporary clone for experimenting or finding out to which
 point you should restore.
 
+## Automated Restore in place (Point-in-Time Recovery)
+
+The operator supports automated in-place restores, allowing you to restore a database to a specific point in time without changing connection strings on the application side. This feature orchestrates the deletion of the current cluster and the creation of a new one from a backup.
+
+:warning: This is a destructive operation. The existing cluster's StatefulSet and pods will be deleted as part of the process. Ensure you have a reliable backup strategy and have tested the restore process in a non-production environment.
+
+To trigger an in-place restore, you need to add a special annotation and a `clone` section to your `postgresql` manifest:
+
+*   **Annotate the manifest**: Add the `postgres-operator.zalando.org/action: restore-in-place` annotation to the `metadata` section.
+*   **Specify the recovery target**: Add a `clone` section to the `spec`, providing the `cluster` name and the `timestamp` for the point-in-time recovery. The `cluster` name **must** be the same as the `metadata.name` of the cluster you are restoring. The `timestamp` must be in RFC 3339 format and point to a time in the past for which you have WAL archives.
+
+Here is an example manifest snippet:
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-minimal-cluster
+  annotations:
+    postgres-operator.zalando.org/action: restore-in-place
+spec:
+  # ... other cluster parameters
+  clone:
+    cluster: "acid-minimal-cluster" # Must match metadata.name
+    uid: "<original_UID>"
+    timestamp: "2022-04-01T10:11:12+00:00"
+  # ... other cluster parameters
+```
+
+When you apply this manifest, the operator will:
+*   See the `restore-in-place` annotation and begin the restore workflow.
+*   Store the restore request and the new cluster definition in a temporary `ConfigMap`.
+*   Delete the existing `postgresql` custom resource, which triggers the deletion of the associated StatefulSet and pods.
+*   Wait for the old cluster to be fully terminated.
+*   Create a new `postgresql` resource with a new UID but the same name.
+*   The new cluster will bootstrap from the latest base backup prior to the given `timestamp` and replay WAL files to recover to the specified point in time.
+
+The process is asynchronous. You can monitor the operator logs and the state of the `postgresql` resource to follow the progress. Once the new cluster is up and running, your applications can reconnect.
+
 ## Setting up a standby cluster
 
 Standby cluster is a [Patroni feature](https://github.com/zalando/patroni/blob/master/docs/replica_bootstrap.rst#standby-cluster)
@@ -1291,3 +1330,4 @@ As of now, the operator does not sync the pooler deployment automatically
 which means that changes in the pod template are not caught. You need to
 toggle `enableConnectionPooler` to set environment variables, volumes, secret
 mounts and securityContext required for TLS support in the pooler pod.
+
