@@ -1,0 +1,163 @@
+name: Build and Push Docker Images to Harbor
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+    branches:
+      - 'scalefield_v*'
+  workflow_dispatch:
+    inputs:
+      image_tags:
+        description: 'Comma-separated list of tags'
+        required: true
+        type: string
+      run_e2e_tests:
+        description: 'Run E2E tests'
+        required: false
+        type: boolean
+        default: true
+      push_image:
+        description: 'Push images to Harbor'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e-tests:
+    name: Run E2E Tests
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_tests)
+    uses: ./.github/workflows/run_e2e.yaml
+
+  build-and-push:
+    name: Build and Push Docker Images to Harbor
+    needs: [e2e-tests]
+    if: always() && (needs.e2e-tests.result == 'success' || needs.e2e-tests.result == 'skipped')
+    runs-on: ubuntu-latest-m
+    env:
+      SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine tags
+        id: tags
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tags=${{ inputs.image_tags }}" >> $GITHUB_OUTPUT
+          else
+            FULL_SHA="${{ github.sha }}"
+            SHORT_SHA="${FULL_SHA:0:7}"
+            echo "tags=${FULL_SHA},${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Harbor tags
+        id: harbor_tags
+        run: |
+          {
+            echo "operator_tags<<EOF"
+            IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
+            for tag in "${TAG_ARRAY[@]}"; do
+              echo "${{ vars.HARBOR_ORG }}/scalefield/postgres-operator:${tag}"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "logical_backup_tags<<EOF"
+            IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
+            for tag in "${TAG_ARRAY[@]}"; do
+              echo "${{ vars.HARBOR_ORG }}/scalefield/postgres-operator/logical-backup:${tag}"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Debug tags
+        run: |
+          echo "::group::Operator Image Tags"
+          echo "${{ steps.harbor_tags.outputs.operator_tags }}"
+          echo "::endgroup::"
+          echo "::group::Logical Backup Image Tags"
+          echo "${{ steps.harbor_tags.outputs.logical_backup_tags }}"
+          echo "::endgroup::"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.0.0
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.HARBOR_ORG }}
+          username: ${{ vars.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push operator image
+        id: build_operator
+        uses: docker/build-push-action@v7
+        continue-on-error: true
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.harbor_tags.outputs.operator_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Notify Slack on operator build failure
+        if: steps.build_operator.outcome == 'failure'
+        uses: rtCamp/action-slack-notify@master
+        env:
+          SLACK_USERNAME: 'GitHub Actions'
+          SLACK_ICON_EMOJI: ':x:'
+          SLACK_COLOR: '#FF0000'
+          SLACK_TITLE: 'Postgres Operator image build failed'
+          SLACK_MESSAGE: 'Failed to build `postgres-operator` image with tags `${{ steps.tags.outputs.tags }}`. Please check the workflow logs for details.'
+
+      - name: Build and push logical-backup image
+        id: build_logical_backup
+        uses: docker/build-push-action@v7
+        continue-on-error: true
+        with:
+          context: logical-backup
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.harbor_tags.outputs.logical_backup_tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Notify Slack on logical-backup build failure
+        if: steps.build_logical_backup.outcome == 'failure'
+        uses: rtCamp/action-slack-notify@master
+        env:
+          SLACK_USERNAME: 'GitHub Actions'
+          SLACK_ICON_EMOJI: ':x:'
+          SLACK_COLOR: '#FF0000'
+          SLACK_TITLE: 'Logical-backup image build failed'
+          SLACK_MESSAGE: 'Failed to build `postgres-operator/logical-backup` image with tags `${{ steps.tags.outputs.tags }}`. Please check the workflow logs for details.'
+
+      - name: Check for build failures
+        if: steps.build_operator.outcome == 'failure' || steps.build_logical_backup.outcome == 'failure'
+        run: exit 1
+
+      - name: Notify Slack - Success
+        if: success()
+        uses: rtCamp/action-slack-notify@master
+        env:
+          SLACK_USERNAME: 'GitHub Actions'
+          SLACK_ICON_EMOJI: ':rocket:'
+          SLACK_COLOR: '#3278BD'
+          SLACK_TITLE: 'Images deployed to Harbor'
+          SLACK_MESSAGE: |
+            Postgres Operator images pushed with tags `${{ steps.tags.outputs.tags }}`.
+            Operator: ${{ vars.HARBOR_ORG }}/scalefield/postgres-operator
+            Logical-backup: ${{ vars.HARBOR_ORG }}/scalefield/postgres-operator/logical-backup
+            Harbor: https://containers.cybertec.at/harbor/projects/3/repositories/postgres-operator/artifacts-tab
+
