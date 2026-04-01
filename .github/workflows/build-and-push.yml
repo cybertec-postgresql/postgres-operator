@@ -1,6 +1,12 @@
 name: Build and Push Docker Images to Harbor
 
 on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+    branches:
+      - 'scalefield_v*'
   push:
     paths-ignore:
       - '**.md'
@@ -17,7 +23,7 @@ on:
         description: 'Run E2E tests'
         required: false
         type: boolean
-        default: true
+        default: false
       push_image:
         description: 'Push images to Harbor'
         required: false
@@ -25,20 +31,21 @@ on:
         default: true
 
 concurrency:
-  group: ${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
   e2e-tests:
     name: Run E2E Tests
-    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_tests)
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_tests)
     uses: ./.github/workflows/run_e2e.yaml
 
   build-and-push:
     name: Build and Push Docker Images to Harbor
     needs: [e2e-tests]
     if: always() && (needs.e2e-tests.result == 'success' || needs.e2e-tests.result == 'skipped')
-    runs-on: ubuntu-latest-m
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
     steps:
