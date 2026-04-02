@@ -19,11 +19,6 @@ on:
         description: 'Comma-separated list of tags'
         required: true
         type: string
-      run_e2e_tests:
-        description: 'Run E2E tests'
-        required: false
-        type: boolean
-        default: false
       push_image:
         description: 'Push images to Harbor'
         required: false
@@ -35,15 +30,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  e2e-tests:
-    name: Run E2E Tests
-    if: github.event_name == 'push' || github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.run_e2e_tests)
-    uses: ./.github/workflows/run_e2e.yaml
-
   build-and-push:
     name: Build and Push Docker Images to Harbor
-    needs: [e2e-tests]
-    if: always() && (needs.e2e-tests.result == 'success' || needs.e2e-tests.result == 'skipped')
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
