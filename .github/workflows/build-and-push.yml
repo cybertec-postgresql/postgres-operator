@@ -47,6 +47,7 @@ jobs:
             FULL_SHA="${{ github.sha }}"
             SHORT_SHA="${FULL_SHA:0:7}"
             BRANCH_NAME="${{ github.ref_name }}"
+            BRANCH_NAME="${BRANCH_NAME//\//-}"
             echo "tags=${BRANCH_NAME},${FULL_SHA},${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
 
