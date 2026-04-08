@@ -46,7 +46,11 @@ jobs:
           else
             FULL_SHA="${{ github.sha }}"
             SHORT_SHA="${FULL_SHA:0:7}"
-            BRANCH_NAME="${{ github.ref_name }}"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              BRANCH_NAME="${{ github.head_ref }}"
+            else
+              BRANCH_NAME="${{ github.ref_name }}"
+            fi
             BRANCH_NAME="${BRANCH_NAME//\//-}"
             echo "tags=${BRANCH_NAME},${FULL_SHA},${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
