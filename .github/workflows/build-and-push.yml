@@ -70,7 +70,7 @@ jobs:
             echo "logical_backup_tags<<EOF"
             IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
             for tag in "${TAG_ARRAY[@]}"; do
-              echo "${{ vars.HARBOR_ORG }}/scalefield/postgres-operator/logical-backup:${tag}"
+              echo "${{ vars.HARBOR_ORG }}/scalefield/logical-backup:${tag}"
             done
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
