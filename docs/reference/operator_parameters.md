@@ -9,6 +9,7 @@ configuration.
 Variable names are underscore-separated words.
 
 ### ConfigMaps-based
+
 The configuration is supplied in a
 key-value configmap, defined by the `CONFIG_MAP_NAME` environment variable.
 Non-scalar values, i.e. lists or maps, are encoded in the value strings using
@@ -25,6 +26,7 @@ operator CRD, all the CRD defaults are provided in the
 [operator's default configuration manifest](https://github.com/zalando/postgres-operator/blob/master/manifests/postgresql-operator-default-configuration.yaml)
 
 ### CRD-based configuration
+
 The configuration is stored in a custom YAML
 manifest. The manifest is an instance of the custom resource definition (CRD)
 called `OperatorConfiguration`. The operator registers this CRD during the
@@ -186,6 +188,9 @@ Those are top-level keys, containing both leaf keys and groups.
 
 * **repair_period**
   period between consecutive repair requests. The default is `5m`.
+
+* **pitr_backup_retention**
+  retention time for PITR (Point-In-Time-Recovery) state ConfigMaps. The operator will clean up ConfigMaps older than the configured retention. The value is a [duration string](https://pkg.go.dev/time#ParseDuration), e.g. "168h" (which is 7 days), "24h". The default is `168h`.
 
 * **set_memory_request_to_limit**
   Set `memory_request` to `memory_limit` for all Postgres clusters (the default
@@ -934,6 +939,7 @@ key.
   ```yaml
   teams_api_role_configuration: "log_statement:all,search_path:'data,public'"
   ```
+
   The default is `"log_statement:all"`
 
 * **enable_team_superuser**

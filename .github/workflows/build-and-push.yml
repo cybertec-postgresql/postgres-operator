@@ -46,7 +46,12 @@ jobs:
           else
             FULL_SHA="${{ github.sha }}"
             SHORT_SHA="${FULL_SHA:0:7}"
-            BRANCH_NAME="${{ github.ref_name }}"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              BRANCH_NAME="${{ github.head_ref }}"
+            else
+              BRANCH_NAME="${{ github.ref_name }}"
+            fi
+            BRANCH_NAME="${BRANCH_NAME//\//-}"
             echo "tags=${BRANCH_NAME},${FULL_SHA},${SHORT_SHA}" >> $GITHUB_OUTPUT
           fi
 
@@ -65,7 +70,7 @@ jobs:
             echo "logical_backup_tags<<EOF"
             IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
             for tag in "${TAG_ARRAY[@]}"; do
-              echo "${{ vars.HARBOR_ORG }}/scalefield/postgres-operator/logical-backup:${tag}"
+              echo "${{ vars.HARBOR_ORG }}/scalefield/logical-backup:${tag}"
             done
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
@@ -102,6 +107,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
           tags: ${{ steps.harbor_tags.outputs.operator_tags }}
+          build-args: BASE_IMAGE=alpine:3
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -114,6 +120,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
           tags: ${{ steps.harbor_tags.outputs.logical_backup_tags }}
+          build-args: BASE_IMAGE=ubuntu:22.04
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

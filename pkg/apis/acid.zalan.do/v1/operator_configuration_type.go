@@ -3,9 +3,9 @@ package v1
 // Operator configuration CRD definition, please use snake_case for field names.
 
 import (
-	"github.com/zalando/postgres-operator/pkg/util/config"
-
 	"time"
+
+	"github.com/zalando/postgres-operator/pkg/util/config"
 
 	"github.com/zalando/postgres-operator/pkg/spec"
 	v1 "k8s.io/api/core/v1"
@@ -267,6 +267,7 @@ type OperatorConfigurationData struct {
 	ResyncPeriod                  Duration                           `json:"resync_period,omitempty"`
 	RepairPeriod                  Duration                           `json:"repair_period,omitempty"`
 	MaintenanceWindows            []MaintenanceWindow                `json:"maintenance_windows,omitempty"`
+	PitrBackupRetention           Duration                           `json:"pitr_backup_retention,omitempty"`
 	SetMemoryRequestToLimit       bool                               `json:"set_memory_request_to_limit,omitempty"`
 	ShmVolume                     *bool                              `json:"enable_shm_volume,omitempty"`
 	SidecarImages                 map[string]string                  `json:"sidecar_docker_images,omitempty"` // deprecated in favour of SidecarContainers
