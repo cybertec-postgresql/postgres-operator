@@ -3,6 +3,7 @@ package cluster
 // Postgres CustomResourceDefinition object i.e. Spilo
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
@@ -33,6 +34,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/rest"
@@ -71,7 +73,7 @@ type kubeResources struct {
 	CriticalOpPodDisruptionBudget *policyv1.PodDisruptionBudget
 	LogicalBackupJob              *batchv1.CronJob
 	Streams                       map[string]*zalandov1.FabricEventStream
-	//Pods are treated separately
+	// Pods are treated separately
 }
 
 // Cluster describes postgresql cluster
@@ -96,7 +98,7 @@ type Cluster struct {
 
 	teamsAPIClient      teams.Interface
 	oauthTokenGetter    OAuthTokenGetter
-	KubeClient          k8sutil.KubernetesClient //TODO: move clients to the better place?
+	KubeClient          k8sutil.KubernetesClient // TODO: move clients to the better place?
 	currentProcess      Process
 	processMu           sync.RWMutex // protects the current operation for reporting, no need to hold the master mutex
 	specMu              sync.RWMutex // protects the spec for reporting, no need to hold the master mutex
@@ -150,7 +152,8 @@ func New(cfg Config, kubeClient k8sutil.KubernetesClient, pgSpec acidv1.Postgres
 			PatroniEndpoints:  make(map[string]*v1.Endpoints),
 			PatroniConfigMaps: make(map[string]*v1.ConfigMap),
 			VolumeClaims:      make(map[types.UID]*v1.PersistentVolumeClaim),
-			Streams:           make(map[string]*zalandov1.FabricEventStream)},
+			Streams:           make(map[string]*zalandov1.FabricEventStream),
+		},
 		userSyncStrategy: users.DefaultUserSyncStrategy{
 			PasswordEncryption:   passwordEncryption,
 			RoleDeletionSuffix:   cfg.OpConfig.RoleDeletionSuffix,
@@ -436,6 +439,33 @@ func (c *Cluster) Create() (err error) {
 		c.logger.Errorf("could not list resources: %v", err)
 	}
 
+	if err := c.updatePITRResources(PitrStateLabelValueFinished); err != nil {
+		return fmt.Errorf("could not update pitr resources: %v", err)
+	}
+	return nil
+}
+
+// update the label to finished for PITR for the given config map
+func (c *Cluster) updatePITRResources(state string) error {
+	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
+	cmNamespace := c.Namespace
+	patchPayload := map[string]any{
+		"metadata": map[string]any{
+			"labels": map[string]string{
+				PitrStateLabelKey: state,
+			},
+		},
+	}
+
+	data, _ := json.Marshal(patchPayload)
+	if _, err := c.KubeClient.ConfigMaps(cmNamespace).Patch(context.TODO(), cmName, types.MergePatchType, data, metav1.PatchOptions{}, ""); err != nil {
+		// If ConfigMap doesn't exist, this is a normal cluster creation (not a restore-in-place)
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		c.logger.Errorf("restore-in-place: error updating config map label to state: %v", err)
+		return err
+	}
 	return nil
 }
 
@@ -445,7 +475,7 @@ func (c *Cluster) compareStatefulSetWith(statefulSet *appsv1.StatefulSet) *compa
 	var match, needsRollUpdate, needsReplace bool
 
 	match = true
-	//TODO: improve me
+	// TODO: improve me
 	if *c.Statefulset.Spec.Replicas != *statefulSet.Spec.Replicas {
 		match = false
 		reasons = append(reasons, "new statefulset's number of replicas does not match the current one")
@@ -677,7 +707,6 @@ func compareResourcesAssumeFirstNotNil(a *v1.ResourceRequirements, b *v1.Resourc
 		}
 	}
 	return true
-
 }
 
 func compareEnv(a, b []v1.EnvVar) bool {
@@ -712,9 +741,7 @@ func compareEnv(a, b []v1.EnvVar) bool {
 }
 
 func compareSpiloConfiguration(configa, configb string) bool {
-	var (
-		oa, ob spiloConfiguration
-	)
+	var oa, ob spiloConfiguration
 
 	var err error
 	err = json.Unmarshal([]byte(configa), &oa)
@@ -823,7 +850,6 @@ func (c *Cluster) compareAnnotations(old, new map[string]string, removedList *[]
 	}
 
 	return reason != "", reason
-
 }
 
 func (c *Cluster) compareServices(old, new *v1.Service) (bool, string) {
@@ -900,7 +926,7 @@ func (c *Cluster) compareLogicalBackupJob(cur, new *batchv1.CronJob) *compareLog
 }
 
 func (c *Cluster) comparePodDisruptionBudget(cur, new *policyv1.PodDisruptionBudget) (bool, string) {
-	//TODO: improve comparison
+	// TODO: improve comparison
 	if !reflect.DeepEqual(new.Spec, cur.Spec) {
 		return false, "new PDB's spec does not match the current one"
 	}
@@ -1073,7 +1099,7 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 			}
 
 			c.logger.Debug("syncing secrets")
-			//TODO: mind the secrets of the deleted/new users
+			// TODO: mind the secrets of the deleted/new users
 			if err := c.syncSecrets(); err != nil {
 				c.logger.Errorf("could not sync secrets: %v", err)
 				updateFailed = true
@@ -1111,7 +1137,6 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 
 	// logical backup job
 	func() {
-
 		// create if it did not exist
 		if !oldSpec.Spec.EnableLogicalBackup && newSpec.Spec.EnableLogicalBackup {
 			c.logger.Debug("creating backup cron job")
@@ -1139,7 +1164,6 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 				updateFailed = true
 			}
 		}
-
 	}()
 
 	// Roles and Databases
@@ -1210,17 +1234,46 @@ func syncResources(a, b *v1.ResourceRequirements) bool {
 	return false
 }
 
+const (
+	PitrStateLabelKey             = "postgres-operator.zalando.org/pitr-state"
+	PitrStateLabelValuePending    = "pending"
+	PitrStateLabelValueInProgress = "in-progress"
+	PitrStateLabelValueFinished   = "finished"
+	PitrConfigMapNameTemplate     = "pitr-state-%s"
+	PitrSpecDataKey               = "spec"
+)
+
+func (c *Cluster) isRestoreInPlace() bool {
+	cmName := fmt.Sprintf(PitrConfigMapNameTemplate, c.Name)
+	cm, err := c.KubeClient.ConfigMaps(c.Namespace).Get(context.TODO(), cmName, metav1.GetOptions{})
+	if err != nil {
+		c.logger.Debugf("restore-in-place: Error while fetching config map: %s before deletion", cmName)
+		return false
+	}
+
+	if cm != nil {
+		if val, ok := cm.Labels[PitrStateLabelKey]; ok {
+			if val == PitrStateLabelValuePending {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // Delete deletes the cluster and cleans up all objects associated with it (including statefulsets).
 // The deletion order here is somewhat significant, because Patroni, when running with the Kubernetes
 // DCS, reuses the master's endpoint to store the leader related metadata. If we remove the endpoint
 // before the pods, it will be re-created by the current master pod and will remain, obstructing the
 // creation of the new cluster with the same name. Therefore, the endpoints should be deleted last.
 func (c *Cluster) Delete() error {
-	var anyErrors = false
+	anyErrors := false
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.eventRecorder.Event(c.GetReference(), v1.EventTypeNormal, "Delete", "Started deletion of cluster resources")
 
+	isRestoreInPlace := c.isRestoreInPlace()
+	c.logger.Debugf("restore-in-place: Deleting the cluster, verifying whether resotore-in-place is true or not: %+v\n", isRestoreInPlace)
 	if err := c.deleteStreams(); err != nil {
 		anyErrors = true
 		c.logger.Warningf("could not delete event streams: %v", err)
@@ -1241,7 +1294,7 @@ func (c *Cluster) Delete() error {
 		c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete statefulset: %v", err)
 	}
 
-	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion {
+	if c.OpConfig.EnableSecretsDeletion != nil && *c.OpConfig.EnableSecretsDeletion && !isRestoreInPlace {
 		if err := c.deleteSecrets(); err != nil {
 			anyErrors = true
 			c.logger.Warningf("could not delete secrets: %v", err)
@@ -1266,10 +1319,12 @@ func (c *Cluster) Delete() error {
 			}
 		}
 
-		if err := c.deleteService(role); err != nil {
-			anyErrors = true
-			c.logger.Warningf("could not delete %s service: %v", role, err)
-			c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+		if !isRestoreInPlace {
+			if err := c.deleteService(role); err != nil {
+				anyErrors = true
+				c.logger.Warningf("could not delete %s service: %v", role, err)
+				c.eventRecorder.Eventf(c.GetReference(), v1.EventTypeWarning, "Delete", "could not delete %s service: %v", role, err)
+			}
 		}
 	}
 
@@ -1307,7 +1362,6 @@ func (c *Cluster) NeedsRepair() (bool, acidv1.PostgresStatus) {
 	c.specMu.RLock()
 	defer c.specMu.RUnlock()
 	return !c.Status.Success(), c.Status
-
 }
 
 // ReceivePodEvent is called back by the controller in order to add the cluster's pod event to the queue.
@@ -1416,7 +1470,6 @@ func (c *Cluster) initSystemUsers() {
 }
 
 func (c *Cluster) initPreparedDatabaseRoles() error {
-
 	if c.Spec.PreparedDatabases != nil && len(c.Spec.PreparedDatabases) == 0 { // TODO: add option to disable creating such a default DB
 		c.Spec.PreparedDatabases = map[string]acidv1.PreparedDatabase{strings.Replace(c.Name, "-", "_", -1): {}}
 	}
@@ -1482,10 +1535,9 @@ func (c *Cluster) initPreparedDatabaseRoles() error {
 }
 
 func (c *Cluster) initDefaultRoles(defaultRoles map[string]string, admin, prefix, searchPath, secretNamespace string) error {
-
 	for defaultRole, inherits := range defaultRoles {
 		namespace := c.Namespace
-		//if namespaced secrets are allowed
+		// if namespaced secrets are allowed
 		if secretNamespace != "" {
 			if c.Config.OpConfig.EnableCrossNamespaceSecret {
 				namespace = secretNamespace
@@ -1553,7 +1605,7 @@ func (c *Cluster) initRobotUsers() error {
 			}
 		}
 
-		//if namespaced secrets are allowed
+		// if namespaced secrets are allowed
 		if c.Config.OpConfig.EnableCrossNamespaceSecret {
 			if strings.Contains(username, ".") {
 				splits := strings.Split(username, ".")
@@ -1604,7 +1656,6 @@ func (c *Cluster) initAdditionalOwnerRoles() {
 
 func (c *Cluster) initTeamMembers(teamID string, isPostgresSuperuserTeam bool) error {
 	teamMembers, err := c.getTeamMembers(teamID)
-
 	if err != nil {
 		return fmt.Errorf("could not get list of team members for team %q: %v", teamID, err)
 	}
@@ -1643,7 +1694,6 @@ func (c *Cluster) initTeamMembers(teamID string, isPostgresSuperuserTeam bool) e
 }
 
 func (c *Cluster) initHumanUsers() error {
-
 	var clusterIsOwnedBySuperuserTeam bool
 	superuserTeams := []string{}
 

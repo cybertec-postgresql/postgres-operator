@@ -10,6 +10,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -301,6 +302,21 @@ func (c *Cluster) createService(role PostgresRole) (*v1.Service, error) {
 	c.setProcessName("creating %v service", role)
 
 	serviceSpec := c.generateService(role, &c.Spec)
+
+	// check if the service already exists in case of pitr
+	svc, err := c.KubeClient.Services(serviceSpec.Namespace).Get(context.TODO(), serviceSpec.Name, metav1.GetOptions{})
+
+	// service already exists
+	if err == nil {
+		c.Services[role] = svc
+		return svc, nil
+	}
+
+	if !errors.IsNotFound(err) {
+		return nil, err
+	}
+
+	// at last create the service
 	service, err := c.KubeClient.Services(serviceSpec.Namespace).Create(context.TODO(), serviceSpec, metav1.CreateOptions{})
 	if err != nil {
 		return nil, err

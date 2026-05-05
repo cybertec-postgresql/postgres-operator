@@ -1,0 +1,126 @@
+name: Build and Push Docker Images to Harbor
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+    branches:
+      - 'scalefield_v*'
+  push:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+    branches:
+      - 'scalefield_v*'
+  workflow_dispatch:
+    inputs:
+      image_tags:
+        description: 'Comma-separated list of tags'
+        required: true
+        type: string
+      push_image:
+        description: 'Push images to Harbor'
+        required: false
+        type: boolean
+        default: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-push:
+    name: Build and Push Docker Images to Harbor
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Determine tags
+        id: tags
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "tags=${{ inputs.image_tags }}" >> $GITHUB_OUTPUT
+          else
+            FULL_SHA="${{ github.sha }}"
+            SHORT_SHA="${FULL_SHA:0:7}"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              BRANCH_NAME="${{ github.head_ref }}"
+            else
+              BRANCH_NAME="${{ github.ref_name }}"
+            fi
+            BRANCH_NAME="${BRANCH_NAME//\//-}"
+            echo "tags=${BRANCH_NAME},${FULL_SHA},${SHORT_SHA}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate Harbor tags
+        id: harbor_tags
+        run: |
+          {
+            echo "operator_tags<<EOF"
+            IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
+            for tag in "${TAG_ARRAY[@]}"; do
+              echo "${{ vars.HARBOR_ORG }}/scalefield/postgres-operator:${tag}"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "logical_backup_tags<<EOF"
+            IFS=',' read -ra TAG_ARRAY <<< "${{ steps.tags.outputs.tags }}"
+            for tag in "${TAG_ARRAY[@]}"; do
+              echo "${{ vars.HARBOR_ORG }}/scalefield/logical-backup:${tag}"
+            done
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Debug tags
+        run: |
+          echo "::group::Operator Image Tags"
+          echo "${{ steps.harbor_tags.outputs.operator_tags }}"
+          echo "::endgroup::"
+          echo "::group::Logical Backup Image Tags"
+          echo "${{ steps.harbor_tags.outputs.logical_backup_tags }}"
+          echo "::endgroup::"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4.0.0
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ vars.HARBOR_ORG }}
+          username: ${{ vars.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Build and push operator image
+        id: build_operator
+        uses: docker/build-push-action@v7
+        continue-on-error: true
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.harbor_tags.outputs.operator_tags }}
+          build-args: BASE_IMAGE=alpine:3
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push logical-backup image
+        id: build_logical_backup
+        uses: docker/build-push-action@v7
+        continue-on-error: true
+        with:
+          context: logical-backup
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.push_image }}
+          tags: ${{ steps.harbor_tags.outputs.logical_backup_tags }}
+          build-args: BASE_IMAGE=ubuntu:22.04
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
