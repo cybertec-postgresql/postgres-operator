@@ -13,8 +13,6 @@ import (
 //   - Stopped -> Updating: When user clears lifecycle.phase (wake-up)
 //   - Updating -> Running: Normal sync continues, defer sets final status
 func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv1.Postgresql) bool {
-
-	// FIX B: Detect wake-up by comparing oldSpec status vs newSpec status
 	// When Update() is called, it sets status=Updating before Sync() runs.
 	// So we need to check if oldSpec.Status was Stopped and newSpec is Updating
 	// with lifecycle cleared to properly detect wake-up.
@@ -22,12 +20,12 @@ func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv
 		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusUpdating &&
 		(newSpec.Spec.Lifecycle == nil || newSpec.Spec.Lifecycle.Phase != "stopped")
 
-	// FIX C: Additional wake-up detection with simpler condition
 	// If lifecycle was cleared and we have previousNumberOfInstances and numberOfInstances is 0
 	isWakingUpSimple := newSpec.Spec.Lifecycle == nil || newSpec.Spec.Lifecycle.Phase != "stopped"
 	hasPreviousInstances := newSpec.Status.PreviousNumberOfInstances > 0
 	needsRestore := newSpec.Spec.NumberOfInstances == 0
 
+	// double verification of waking up
 	isWakingUp = isWakingUp || (isWakingUpSimple && hasPreviousInstances && needsRestore)
 
 	// === INITIATE HIBERNATE: Running -> Stopping ===
@@ -76,3 +74,4 @@ func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv
 
 	return true
 }
+
