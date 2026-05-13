@@ -101,6 +101,16 @@ func (postgresStatus PostgresStatus) Creating() bool {
 	return postgresStatus.PostgresClusterStatus == ClusterStatusCreating
 }
 
+// Stopping status of cluster
+func (postgresStatus PostgresStatus) Stopping() bool {
+	return postgresStatus.PostgresClusterStatus == ClusterStatusStopping
+}
+
+// Stopped status of cluster
+func (postgresStatus PostgresStatus) Stopped() bool {
+	return postgresStatus.PostgresClusterStatus == ClusterStatusStopped
+}
+
 func (postgresStatus PostgresStatus) String() string {
 	return postgresStatus.PostgresClusterStatus
 }

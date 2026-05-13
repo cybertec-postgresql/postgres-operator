@@ -1008,11 +1008,92 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Block all spec changes when cluster is stopped or stopping
+	if c.Status.Stopped() || c.Status.Stopping() {
+		lifecyclePhase := ""
+		if newSpec.Spec.Lifecycle != nil {
+			lifecyclePhase = newSpec.Spec.Lifecycle.Phase
+		}
+		// During Stopping: block ALL spec changes (no cancellation allowed)
+		// During Stopped: only block if keeping lifecycle.phase="stopped"
+		if c.Status.Stopping() {
+			return fmt.Errorf("cannot update cluster while it is stopping. Wait for it to fully stop first")
+		}
+		if lifecyclePhase == "stopped" {
+			return fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase to wake up the cluster")
+		}
+	}
+
 	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
 
 	newSpec, err := c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
 	if err != nil {
 		return fmt.Errorf("could not set cluster status to updating: %w", err)
+	}
+
+	// Check if user is initiating hibernate (Running -> Stopping)
+	if c.Status.Running() && newSpec.Spec.Lifecycle != nil && newSpec.Spec.Lifecycle.Phase == "stopped" {
+		c.logger.Infof("[lifecycle] initiating hibernate for cluster %s: current numberOfInstances=%d", c.Name, c.Spec.NumberOfInstances)
+
+		// Store previousNumberOfInstances BEFORE setting numberOfInstances to 0
+		newSpec.Status.PreviousNumberOfInstances = c.Spec.NumberOfInstances
+		newSpec.Spec.NumberOfInstances = 0
+		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopping
+
+		c.logger.Infof("[lifecycle] hibernate initiated: setting numberOfInstances=0, previousNumberOfInstances=%d", newSpec.Status.PreviousNumberOfInstances)
+
+		// Update spec first (Update only updates spec when CR has status subresource)
+		pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
+		if err != nil {
+			return fmt.Errorf("could not update spec during hibernate: %w", err)
+		}
+		c.logger.Infof("[lifecycle] hibernate: spec updated successfully")
+
+		// Update status separately - we need to preserve the status values we set
+		// because UpdatePostgresCR returns object with status zeroed (subresource behavior)
+		pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
+		pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
+
+		pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
+		if err != nil {
+			return fmt.Errorf("could not update status during hibernate: %w", err)
+		}
+		c.logger.Infof("[lifecycle] hibernate: status updated successfully, previousNumberOfInstances=%d", pgUpdated.Status.PreviousNumberOfInstances)
+
+		c.setSpec(pgUpdated)
+		return nil
+	}
+
+	// Check if user is waking up from stopped state (Stopped -> Running)
+	// This is when user clears lifecycle.phase to wake up the cluster
+	if c.Status.Stopped() && (newSpec.Spec.Lifecycle == nil || newSpec.Spec.Lifecycle.Phase != "stopped") {
+		if newSpec.Status.PreviousNumberOfInstances > 0 {
+			c.logger.Infof("[lifecycle] waking up cluster %s: restoring numberOfInstances=%d", c.Name, newSpec.Status.PreviousNumberOfInstances)
+
+			// Restore numberOfInstances from previousNumberOfInstances
+			newSpec.Spec.NumberOfInstances = newSpec.Status.PreviousNumberOfInstances
+			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
+
+			// Update spec first
+			pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
+			if err != nil {
+				return fmt.Errorf("could not update spec during wake-up: %w", err)
+			}
+			c.logger.Infof("[lifecycle] wake-up: spec updated successfully")
+
+			// Update status separately, and clear previousNumberOfInstances after restore
+			pgUpdated.Status.PreviousNumberOfInstances = 0 // Clear after successful restore
+			pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
+
+			pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
+			if err != nil {
+				return fmt.Errorf("could not update status during wake-up: %w", err)
+			}
+			c.logger.Infof("[lifecycle] wake-up: status updated successfully, previousNumberOfInstances cleared")
+
+			c.setSpec(pgUpdated)
+			return nil
+		}
 	}
 
 	if !c.isInMaintenanceWindow(newSpec.Spec.MaintenanceWindows) {
