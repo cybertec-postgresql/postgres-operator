@@ -1,6 +1,13 @@
 package cluster
 
 import (
+	"context"
+	"fmt"
+
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
 )
 
@@ -73,5 +80,84 @@ func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv
 	}
 
 	return true
+}
+
+// getPoolerReplicas returns the current replica count for a pooler role.
+// Returns 0 if pooler doesn't exist or hasn't been synced yet.
+func (c *Cluster) getPoolerReplicas(role PostgresRole) int32 {
+	if c.ConnectionPooler == nil || c.ConnectionPooler[role] == nil ||
+		c.ConnectionPooler[role].Deployment == nil ||
+		c.ConnectionPooler[role].Deployment.Spec.Replicas == nil {
+		return 0
+	}
+	return *c.ConnectionPooler[role].Deployment.Spec.Replicas
+}
+
+// scalePoolerDown scales pooler deployments to 0 and stores current replica count.
+// Should be called during hibernate initiation.
+func (c *Cluster) scalePoolerDown(newSpec *acidv1.Postgresql) error {
+	if c.ConnectionPooler == nil {
+		return nil
+	}
+
+	for role := range c.ConnectionPooler {
+		replicas := c.getPoolerReplicas(role)
+
+		// Store current replicas in status
+		if newSpec.Status.PreviousPoolerInstances == nil {
+			newSpec.Status.PreviousPoolerInstances = make(map[string]int32)
+		}
+		newSpec.Status.PreviousPoolerInstances[string(role)] = replicas
+
+		// Scale to 0 if currently non-zero
+		if replicas > 0 {
+			if err := c.patchPoolerReplicas(role, 0); err != nil {
+				return err
+			}
+			c.logger.Infof("[lifecycle] pooler %s scaled to 0 (was %d)", role, replicas)
+		}
+	}
+	return nil
+}
+
+// scalePoolerUp restores pooler deployments to previous replica counts.
+// Should be called during wake-up.
+func (c *Cluster) scalePoolerUp(newSpec *acidv1.Postgresql) error {
+	if newSpec.Status.PreviousPoolerInstances == nil {
+		return nil
+	}
+
+	for roleStr, replicas := range newSpec.Status.PreviousPoolerInstances {
+		role := PostgresRole(roleStr)
+
+		// Scale to stored value (could be 0)
+		if err := c.patchPoolerReplicas(role, replicas); err != nil {
+			return err
+		}
+		c.logger.Infof("[lifecycle] pooler %s scaled to %d", role, replicas)
+	}
+	return nil
+}
+
+// patchPoolerReplicas patches the pooler deployment replica count.
+func (c *Cluster) patchPoolerReplicas(role PostgresRole, replicas int32) error {
+	// Check if deployment exists first
+	_, err := c.KubeClient.Deployments(c.Namespace).Get(
+		context.TODO(), c.connectionPoolerName(role), metav1.GetOptions{})
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil // Pooler doesn't exist, no-op
+		}
+		return fmt.Errorf("could not get pooler deployment for %s: %w", role, err)
+	}
+
+	// Patch with merge patch
+	patchData := fmt.Sprintf(`{"spec":{"replicas":%d}}`, replicas)
+	_, err = c.KubeClient.Deployments(c.Namespace).Patch(
+		context.TODO(), c.connectionPoolerName(role), types.MergePatchType, []byte(patchData), metav1.PatchOptions{})
+	if err != nil {
+		return fmt.Errorf("could not patch pooler deployment %s replicas: %w", role, err)
+	}
+	return nil
 }
 

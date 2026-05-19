@@ -4207,6 +4207,11 @@ spec:
               previousNumberOfInstances:
                 format: int32
                 type: integer
+              previousPoolerInstances:
+                type: object
+                additionalProperties:
+                  format: int32
+                  type: integer
             required:
             - PostgresClusterStatus
             type: object

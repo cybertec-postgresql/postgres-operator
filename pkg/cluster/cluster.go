@@ -1281,6 +1281,11 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 		newSpec.Spec.NumberOfInstances = 0
 		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopping
 
+		// Scale down pooler deployments and store current replica counts
+		if err := c.scalePoolerDown(newSpec); err != nil {
+			return false, fmt.Errorf("could not scale pooler during hibernate: %w", err)
+		}
+
 		c.logger.Infof("[lifecycle] hibernate initiated: setting numberOfInstances=0, previousNumberOfInstances=%d", newSpec.Status.PreviousNumberOfInstances)
 
 		// Update spec first (Update only updates spec when CR has status subresource)
@@ -1293,6 +1298,7 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 		// Update status separately - preserve status values since UpdatePostgresCR returns object with status zeroed
 		pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
 		pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
+		pgUpdated.Status.PreviousPoolerInstances = newSpec.Status.PreviousPoolerInstances
 
 		pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
 		if err != nil {
@@ -1309,6 +1315,11 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 		if newSpec.Status.PreviousNumberOfInstances > 0 {
 			c.logger.Infof("[lifecycle] waking up cluster %s: restoring numberOfInstances=%d", c.Name, newSpec.Status.PreviousNumberOfInstances)
 
+			// Restore pooler deployments to previous replica counts FIRST
+			if err := c.scalePoolerUp(newSpec); err != nil {
+				return false, fmt.Errorf("could not scale pooler during wake-up: %w", err)
+			}
+
 			// Restore numberOfInstances from previousNumberOfInstances
 			newSpec.Spec.NumberOfInstances = newSpec.Status.PreviousNumberOfInstances
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
@@ -1320,9 +1331,10 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 			}
 			c.logger.Infof("[lifecycle] wake-up: spec updated successfully")
 
-			// Update status separately, and clear previousNumberOfInstances after restore
+			// Update status separately, and clear previousNumberOfInstances and previousPoolerInstances after restore
 			pgUpdated.Status.PreviousNumberOfInstances = 0
 			pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
+			pgUpdated.Status.PreviousPoolerInstances = nil
 
 			pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
 			if err != nil {

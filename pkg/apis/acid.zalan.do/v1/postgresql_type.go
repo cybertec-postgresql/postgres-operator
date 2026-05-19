@@ -308,8 +308,9 @@ type UserFlags []string
 
 // PostgresStatus contains status of the PostgreSQL cluster (running, creation failed etc.)
 type PostgresStatus struct {
-	PostgresClusterStatus     string `json:"PostgresClusterStatus"`
-	PreviousNumberOfInstances int32  `json:"previousNumberOfInstances,omitempty"`
+	PostgresClusterStatus     string           `json:"PostgresClusterStatus"`
+	PreviousNumberOfInstances int32            `json:"previousNumberOfInstances,omitempty"`
+	PreviousPoolerInstances   map[string]int32 `json:"previousPoolerInstances,omitempty"`
 }
 
 // ConnectionPooler Options for connection pooler
