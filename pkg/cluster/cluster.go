@@ -1286,6 +1286,14 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 			return false, fmt.Errorf("could not scale pooler during hibernate: %w", err)
 		}
 
+		// Suspend logical backup CronJob if enabled
+		if c.Spec.EnableLogicalBackup {
+			if err := c.suspendLogicalBackupJob(); err != nil {
+				return false, fmt.Errorf("could not suspend logical backup job during hibernate: %w", err)
+			}
+			c.logger.Info("[lifecycle] logical backup job suspended")
+		}
+
 		c.logger.Infof("[lifecycle] hibernate initiated: setting numberOfInstances=0, previousNumberOfInstances=%d", newSpec.Status.PreviousNumberOfInstances)
 
 		// Update spec first (Update only updates spec when CR has status subresource)
@@ -1293,7 +1301,7 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 		if err != nil {
 			return false, fmt.Errorf("could not update spec during hibernate: %w", err)
 		}
-		c.logger.Infof("[lifecycle] hibernate: spec updated successfully")
+		c.logger.Info("[lifecycle] hibernate: spec updated successfully")
 
 		// Update status separately - preserve status values since UpdatePostgresCR returns object with status zeroed
 		pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
@@ -1320,6 +1328,14 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 				return false, fmt.Errorf("could not scale pooler during wake-up: %w", err)
 			}
 
+			// Resume logical backup CronJob if enabled
+			if c.Spec.EnableLogicalBackup {
+				if err := c.unsuspendLogicalBackupJob(); err != nil {
+					return false, fmt.Errorf("could not resume logical backup job during wake-up: %w", err)
+				}
+				c.logger.Info("[lifecycle] logical backup job resumed")
+			}
+
 			// Restore numberOfInstances from previousNumberOfInstances
 			newSpec.Spec.NumberOfInstances = newSpec.Status.PreviousNumberOfInstances
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
@@ -1329,7 +1345,7 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 			if err != nil {
 				return false, fmt.Errorf("could not update spec during wake-up: %w", err)
 			}
-			c.logger.Infof("[lifecycle] wake-up: spec updated successfully")
+			c.logger.Info("[lifecycle] wake-up: spec updated successfully")
 
 			// Update status separately, and clear previousNumberOfInstances and previousPoolerInstances after restore
 			pgUpdated.Status.PreviousNumberOfInstances = 0
@@ -1340,7 +1356,7 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 			if err != nil {
 				return false, fmt.Errorf("could not update status during wake-up: %w", err)
 			}
-			c.logger.Infof("[lifecycle] wake-up: status updated successfully, previousNumberOfInstances cleared")
+			c.logger.Info("[lifecycle] wake-up: status updated successfully, previousNumberOfInstances cleared")
 
 			c.setSpec(pgUpdated)
 			return true, nil

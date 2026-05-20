@@ -12,6 +12,7 @@ import (
 	"github.com/zalando/postgres-operator/pkg/util/config"
 	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
 	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
@@ -1232,4 +1233,194 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
 	})
+}
+
+func TestSuspendLogicalBackupJob(t *testing.T) {
+	tests := []struct {
+		name       string
+		jobExists  bool
+		patchFails bool
+		wantErr    bool
+	}{
+		{
+			name:      "job exists, suspend succeeds",
+			jobExists: true,
+			wantErr:   false,
+		},
+		{
+			name:      "job does not exist - no-op",
+			jobExists: false,
+			wantErr:   false,
+		},
+		{
+			name:       "job exists but patch fails",
+			jobExists:  true,
+			patchFails: true,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientSet := fake.NewSimpleClientset()
+			jobName := "logical-backup-test-cluster"
+
+			if tt.jobExists {
+				clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      jobName,
+						Namespace: "default",
+					},
+					Spec: batchv1.CronJobSpec{
+						Schedule: "30 00 * * *",
+					},
+				}, metav1.CreateOptions{})
+			}
+
+			if tt.patchFails {
+				clientSet.PrependReactor("patch", "cronjobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, fmt.Errorf("network error")
+				})
+			}
+
+			kubeClient := &k8sutil.KubernetesClient{
+				CronJobsGetter: clientSet.BatchV1(),
+			}
+
+			var job *batchv1.CronJob
+			if tt.jobExists {
+				job, _ = kubeClient.CronJobs("default").Get(context.TODO(), jobName, metav1.GetOptions{})
+			}
+
+			c := New(
+				Config{
+					OpConfig: config.Config{
+						LogicalBackup: config.LogicalBackup{
+							LogicalBackupJobPrefix: "logical-backup-",
+						},
+					},
+				},
+				*kubeClient,
+				acidv1.Postgresql{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-cluster",
+						Namespace: "default",
+					},
+				},
+				lifecycleLogger,
+				lifecycleEventRecorder,
+			)
+			c.LogicalBackupJob = job
+
+			err := c.suspendLogicalBackupJob()
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				if tt.jobExists && !tt.patchFails {
+					updatedJob, _ := kubeClient.CronJobs("default").Get(context.TODO(), jobName, metav1.GetOptions{})
+					if updatedJob != nil {
+						assert.True(t, *updatedJob.Spec.Suspend, "job should be suspended")
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestUnsuspendLogicalBackupJob(t *testing.T) {
+	tests := []struct {
+		name       string
+		jobExists  bool
+		patchFails bool
+		wantErr    bool
+	}{
+		{
+			name:      "job exists, unsuspend succeeds",
+			jobExists: true,
+			wantErr:   false,
+		},
+		{
+			name:      "job does not exist - no-op",
+			jobExists: false,
+			wantErr:   false,
+		},
+		{
+			name:       "job exists but patch fails",
+			jobExists:  true,
+			patchFails: true,
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			clientSet := fake.NewSimpleClientset()
+			jobName := "logical-backup-test-cluster"
+
+			if tt.jobExists {
+				suspendTrue := true
+				clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      jobName,
+						Namespace: "default",
+					},
+					Spec: batchv1.CronJobSpec{
+						Schedule: "30 00 * * *",
+						Suspend:  &suspendTrue,
+					},
+				}, metav1.CreateOptions{})
+			}
+
+			if tt.patchFails {
+				clientSet.PrependReactor("patch", "cronjobs", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					return true, nil, fmt.Errorf("network error")
+				})
+			}
+
+			kubeClient := &k8sutil.KubernetesClient{
+				CronJobsGetter: clientSet.BatchV1(),
+			}
+
+			var job *batchv1.CronJob
+			if tt.jobExists {
+				job, _ = kubeClient.CronJobs("default").Get(context.TODO(), jobName, metav1.GetOptions{})
+			}
+
+			c := New(
+				Config{
+					OpConfig: config.Config{
+						LogicalBackup: config.LogicalBackup{
+							LogicalBackupJobPrefix: "logical-backup-",
+						},
+					},
+				},
+				*kubeClient,
+				acidv1.Postgresql{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test-cluster",
+						Namespace: "default",
+					},
+				},
+				lifecycleLogger,
+				lifecycleEventRecorder,
+			)
+			c.LogicalBackupJob = job
+
+			err := c.unsuspendLogicalBackupJob()
+
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
+				assert.NoError(t, err)
+				if tt.jobExists && !tt.patchFails {
+					updatedJob, _ := kubeClient.CronJobs("default").Get(context.TODO(), jobName, metav1.GetOptions{})
+					if updatedJob != nil {
+						assert.False(t, *updatedJob.Spec.Suspend, "job should be unsuspended")
+					}
+				}
+			}
+		})
+	}
 }

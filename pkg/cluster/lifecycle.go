@@ -55,7 +55,7 @@ func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv
 	if newSpec.Status.Stopping() {
 		if c.Statefulset != nil && *c.Statefulset.Spec.Replicas == 0 {
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
-			c.logger.Infof("[lifecycle] cluster has stopped, all pods are terminated")
+			c.logger.Info("[lifecycle] cluster has stopped, all pods are terminated")
 		}
 		return true
 	}

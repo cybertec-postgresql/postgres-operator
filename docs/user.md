@@ -964,6 +964,7 @@ When you apply this manifest, the operator will:
 * Set `spec.numberOfInstances` to 0
 * Scale down the StatefulSet to 0 replicas
 * Scale down the connection pooler deployments to 0 replicas
+* Suspend the logical backup CronJob (if enabled)
 * Set `status.PostgresClusterStatus` to "Stopping", then "Stopped"
 
 ### Waking up a Cluster
@@ -986,6 +987,7 @@ When you apply this manifest, the operator will:
 
 * Restore `numberOfInstances` from `status.previousNumberOfInstances`
 * Restore the connection pooler replica counts from `status.previousPoolerInstances`
+* Resume the logical backup CronJob (if enabled)
 * Scale up the StatefulSet to the previous replica count
 * Scale up the connection pooler deployments to the previous replica counts
 * Set `status.PostgresClusterStatus` to "Updating", then "Running"
@@ -1018,6 +1020,16 @@ The connection pooler is automatically scaled alongside the cluster:
 
 Note: If the connection pooler was already at 0 replicas before hibernate, it
 will remain at 0 after wake-up.
+
+### Logical Backup Behavior
+
+The logical backup CronJob is automatically suspended during hibernate:
+
+* When the cluster hibernates, the backup CronJob is suspended (`.spec.suspend: true`)
+* When the cluster wakes up, the backup CronJob is automatically resumed
+* The backup schedule is preserved and resumes from its normal schedule
+
+This prevents failed backup jobs from running when the database is unavailable.
 
 ## Setting up a standby cluster
 
