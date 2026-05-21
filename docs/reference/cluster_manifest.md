@@ -486,6 +486,25 @@ Note that `s3_wal_path` and `gs_wal_path` are mutually exclusive.
   from a remote primary. See the Patroni documentation
   [here](https://patroni.readthedocs.io/en/latest/standby_cluster.html) for more details. Optional.
 
+## Lifecycle configuration
+
+Parameters to control cluster hibernate/wake-up behavior.
+
+* **phase**
+  Set to `"stopped"` to hibernate the cluster. When this field is set on a
+  running cluster, the operator will:
+  * Store the current number of instances in the status
+  * Scale down the StatefulSet to 0 replicas
+  * Scale down the connection pooler to 0 replicas
+  * Set the cluster status to "Stopping", then "Stopped"
+
+  When this field is removed from a stopped cluster, the operator will:
+  * Restore the number of instances from the stored value
+  * Scale up the StatefulSet and connection pooler
+  * Set the cluster status to "Updating", then "Running"
+
+  This field is optional. When not set, the cluster operates normally.
+
 ## Volume properties
 
 Those parameters are grouped under the `volume` top-level key and define the
@@ -714,3 +733,21 @@ can have the following properties:
 
 * **memory**
   memory requests to be set as an annotation on the stream resource. Optional.
+
+## Status fields
+
+The operator reports the cluster state through the `status` sub-resource. These
+fields are managed by the operator and should not be set manually.
+
+* **PostgresClusterStatus**
+  Current state of the cluster. One of: Creating, Updating, Running,
+  UpdateFailed, SyncFailed, CreateFailed, Invalid, Stopping, Stopped.
+
+* **previousNumberOfInstances**
+  The number of instances the cluster had before hibernation. Used to restore
+  the cluster to its previous size when waking up. Cleared after wake-up.
+
+* **previousPoolerInstances**
+  A map of connection pooler role to its replica count before hibernation.
+  The keys are "master" and "replica". Used to restore the pooler when waking
+  up. Cleared after wake-up.

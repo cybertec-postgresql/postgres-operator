@@ -200,6 +200,16 @@ func (client *KubernetesClient) SetPostgresCRDStatus(clusterName spec.Namespaced
 	return pg, nil
 }
 
+// UpdatePostgresCR of Postgres cluster (updates full resource including spec)
+func (client *KubernetesClient) UpdatePostgresCR(clusterName spec.NamespacedName, pg *apiacidv1.Postgresql) (*apiacidv1.Postgresql, error) {
+	pg, err := client.PostgresqlsGetter.Postgresqls(clusterName.Namespace).Update(context.TODO(), pg, metav1.UpdateOptions{})
+	if err != nil {
+		return pg, fmt.Errorf("could not update PostgresCR: %v", err)
+	}
+
+	return pg, nil
+}
+
 // SetFinalizer of Postgres cluster
 func (client *KubernetesClient) SetFinalizer(clusterName spec.NamespacedName, pg *apiacidv1.Postgresql, finalizers []string) (*apiacidv1.Postgresql, error) {
 	var (

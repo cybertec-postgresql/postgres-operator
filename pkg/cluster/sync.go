@@ -47,7 +47,7 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		if err != nil {
 			c.logger.Warningf("error while syncing cluster state: %v", err)
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusSyncFailed
-		} else if !c.Status.Running() {
+		} else if !c.Status.Running() && !c.Status.Stopping() && !c.Status.Stopped() {
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusRunning
 		}
 
@@ -63,6 +63,11 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 
 	if err = c.syncFinalizer(); err != nil {
 		c.logger.Debugf("could not sync finalizers: %v", err)
+	}
+
+	// Handle lifecycle hibernate/wake-up state transitions
+	if !c.manageHibernateState(oldSpec, newSpec) {
+		return nil
 	}
 
 	if err = c.initUsers(); err != nil {

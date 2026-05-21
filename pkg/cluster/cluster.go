@@ -1008,11 +1008,29 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// Block all spec changes when cluster is stopped or stopping
+	blocked, err := c.blockLifecycleUpdate(newSpec)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		return nil
+	}
+
 	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
 
-	newSpec, err := c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
+	newSpec, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
 	if err != nil {
 		return fmt.Errorf("could not set cluster status to updating: %w", err)
+	}
+
+	// Handle lifecycle transitions (hibernate/wake-up)
+	handled, err := c.handleHibernateAndWakeUp(newSpec)
+	if err != nil {
+		return err
+	}
+	if handled {
+		return nil
 	}
 
 	if !c.isInMaintenanceWindow(newSpec.Spec.MaintenanceWindows) {
@@ -1218,6 +1236,79 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	}
 
 	return nil
+}
+
+// blockLifecycleUpdate checks if an update should be blocked due to lifecycle state.
+// Returns (blocked bool, err error):
+//   - (true, nil) if update is blocked and caller should return early
+//   - (false, nil) if update can proceed
+//   - (false, error) on error
+func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error) {
+	if !c.Status.Stopped() && !c.Status.Stopping() {
+		return false, nil
+	}
+
+	lifecyclePhase := ""
+	if newSpec.Spec.Lifecycle != nil {
+		lifecyclePhase = newSpec.Spec.Lifecycle.Phase
+	}
+
+	// During Stopping: block ALL spec changes (no cancellation allowed)
+	if c.Status.Stopping() {
+		return true, fmt.Errorf("cannot update cluster while it is stopping. Wait for it to fully stop first")
+	}
+
+	// During Stopped: only block if keeping lifecycle.phase="stopped"
+	if lifecyclePhase == "stopped" {
+		return true, fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase to wake up the cluster")
+	}
+
+	return false, nil
+}
+
+// handleHibernateAndWakeUp handles cluster hibernate/wake-up transitions during Update().
+// This is the Update path - it detects the transition, modifies the spec via manageHibernateState,
+// and persists the changes to Kubernetes.
+//
+// Returns (handled bool, err error):
+//   - (true, nil) if lifecycle transition was handled, Update() should return early
+//   - (false, nil) if no lifecycle transition, normal update continues
+//   - (false, error) on error during persistence
+//
+// Flow:
+//  1. Detect action via detectLifecycleTransition()
+//  2. Check for Stopping->Stopped (via detectStoppingCompleted)
+//  3. Call manageHibernateState() to prepare the spec (same logic as Sync path)
+//  4. Persist to Kubernetes via persistHibernateTransition/persistWakeUpTransition
+func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, error) {
+	action := detectLifecycleTransition(
+		&c.Status,
+		c.Spec.Lifecycle,
+		newSpec.Spec.Lifecycle,
+		newSpec.Spec.NumberOfInstances,
+		newSpec.Status.PreviousNumberOfInstances,
+		c.Status.Running(),
+	)
+
+	if action == LifecycleActionNone {
+		if detectStoppingCompleted(&c.Status, c.getStatefulsetReplicas()) {
+			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
+			return c.persistStoppingCompletedTransition(newSpec)
+		}
+		return false, nil
+	}
+
+	c.manageHibernateState(c.Postgresql, newSpec)
+
+	switch action {
+	case LifecycleActionHibernate:
+		return c.persistHibernateTransition(newSpec)
+
+	case LifecycleActionWakeUp:
+		return c.persistWakeUpTransition(newSpec)
+	}
+
+	return false, nil
 }
 
 func syncResources(a, b *v1.ResourceRequirements) bool {

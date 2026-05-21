@@ -2354,3 +2354,292 @@ func TestUpdatePITRResources(t *testing.T) {
 		})
 	}
 }
+
+func TestUpdate_LifecycleBlocksDuringStopping(t *testing.T) {
+	clientSet := fake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	client := k8sutil.KubernetesClient{
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: 3,
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus: "Stopping",
+		},
+	}
+
+	cluster := New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+
+	cluster.Name = "test-cluster"
+	cluster.Namespace = "default"
+
+	oldSpec := pg.DeepCopy()
+	newSpec := pg.DeepCopy()
+	newSpec.Spec.NumberOfInstances = 5
+
+	err := cluster.Update(oldSpec, newSpec)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot update cluster while it is stopping")
+}
+
+func TestUpdate_LifecycleBlocksWhenStoppedWithPhase(t *testing.T) {
+	clientSet := fake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	client := k8sutil.KubernetesClient{
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: 0,
+			Lifecycle:         &acidv1.LifecycleSpec{Phase: "stopped"},
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus:      "Stopped",
+			PreviousNumberOfInstances:  3,
+		},
+	}
+
+	cluster := New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+
+	cluster.Name = "test-cluster"
+	cluster.Namespace = "default"
+
+	oldSpec := pg.DeepCopy()
+	newSpec := pg.DeepCopy()
+	newSpec.Spec.NumberOfInstances = 5
+
+	err := cluster.Update(oldSpec, newSpec)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot update cluster while stopped")
+}
+
+func TestUpdate_LifecycleAllowsWakeUp(t *testing.T) {
+	clientSet := fake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	updateCalled := false
+	statusUpdateCalled := false
+
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateAction := action.(k8stesting.UpdateAction)
+		pg := updateAction.GetObject().(*acidv1.Postgresql)
+		updateCalled = true
+		return true, pg, nil
+	})
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "status" {
+			statusUpdateCalled = true
+			updateAction := action.(k8stesting.UpdateAction)
+			pg := updateAction.GetObject().(*acidv1.Postgresql)
+			return true, pg, nil
+		}
+		return false, nil, nil
+	})
+
+	client := k8sutil.KubernetesClient{
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: 0,
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus:      "Stopped",
+			PreviousNumberOfInstances:  3,
+		},
+	}
+
+	cluster := New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+
+	cluster.Name = "test-cluster"
+	cluster.Namespace = "default"
+
+	oldSpec := pg.DeepCopy()
+	newSpec := pg.DeepCopy()
+
+	err := cluster.Update(oldSpec, newSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, updateCalled, "Update should have been called for wake-up")
+	assert.True(t, statusUpdateCalled, "Status update should have been called for wake-up")
+}
+
+func TestUpdate_LifecycleInitiatesHibernate(t *testing.T) {
+	clientSet := fake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	updateCalled := false
+	statusUpdateCalled := false
+
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateAction := action.(k8stesting.UpdateAction)
+		pg := updateAction.GetObject().(*acidv1.Postgresql)
+		updateCalled = true
+		return true, pg, nil
+	})
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if action.GetSubresource() == "status" {
+			statusUpdateCalled = true
+			updateAction := action.(k8stesting.UpdateAction)
+			pg := updateAction.GetObject().(*acidv1.Postgresql)
+			return true, pg, nil
+		}
+		return false, nil, nil
+	})
+
+	client := k8sutil.KubernetesClient{
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: 3,
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus: "Running",
+		},
+	}
+
+	cluster := New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+
+	cluster.Name = "test-cluster"
+	cluster.Namespace = "default"
+
+	oldSpec := pg.DeepCopy()
+	newSpec := pg.DeepCopy()
+	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: "stopped"}
+
+	err := cluster.Update(oldSpec, newSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, updateCalled, "Update should have been called for hibernate")
+	assert.True(t, statusUpdateCalled, "Status update should have been called for hibernate")
+}
+
+func TestUpdate_LifecycleNormalUpdate(t *testing.T) {
+	clientSet := fake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	client := k8sutil.KubernetesClient{
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: 3,
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus: "Running",
+		},
+	}
+
+	cluster := New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+
+	cluster.Name = "test-cluster"
+	cluster.Namespace = "default"
+
+	newSpec := pg.DeepCopy()
+	blocked, err := cluster.blockLifecycleUpdate(newSpec)
+
+	assert.False(t, blocked)
+	assert.NoError(t, err)
+}

@@ -9,6 +9,8 @@ const (
 	ClusterStatusSyncFailed   = "SyncFailed"
 	ClusterStatusAddFailed    = "CreateFailed"
 	ClusterStatusRunning      = "Running"
+	ClusterStatusStopping     = "Stopping"
+	ClusterStatusStopped      = "Stopped"
 	ClusterStatusInvalid      = "Invalid"
 )
 

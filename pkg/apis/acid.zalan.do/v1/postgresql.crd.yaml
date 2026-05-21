@@ -3246,6 +3246,13 @@ spec:
                   - name
                   type: object
                 type: array
+              lifecycle:
+                description: LifecycleSpec describes the lifecycle state of a Postgres
+                  cluster.
+                properties:
+                  phase:
+                    type: string
+                type: object
               logicalBackupRetention:
                 type: string
               logicalBackupSchedule:
@@ -4197,6 +4204,14 @@ spec:
             properties:
               PostgresClusterStatus:
                 type: string
+              previousNumberOfInstances:
+                format: int32
+                type: integer
+              previousPoolerInstances:
+                type: object
+                additionalProperties:
+                  format: int32
+                  type: integer
             required:
             - PostgresClusterStatus
             type: object
