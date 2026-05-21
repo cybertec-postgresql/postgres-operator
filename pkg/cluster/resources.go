@@ -825,57 +825,7 @@ func (c *Cluster) deleteLogicalBackupJob() error {
 	return nil
 }
 
-func (c *Cluster) suspendLogicalBackupJob() error {
-	if c.LogicalBackupJob == nil {
-		c.logger.Debug("logical backup job is not loaded, skipping suspend")
-		return nil
-	}
 
-	c.setProcessName("suspending logical backup job")
-
-	patchData := fmt.Sprintf(`{"spec":{"suspend":true}}`)
-	cronJob, err := c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Patch(
-		context.TODO(),
-		c.getLogicalBackupJobName(),
-		types.MergePatchType,
-		[]byte(patchData),
-		metav1.PatchOptions{},
-		"",
-	)
-	if err != nil {
-		return fmt.Errorf("could not suspend logical backup job: %w", err)
-	}
-	c.LogicalBackupJob = cronJob
-	c.logger.Info("logical backup job suspended")
-
-	return nil
-}
-
-func (c *Cluster) unsuspendLogicalBackupJob() error {
-	if c.LogicalBackupJob == nil {
-		c.logger.Debug("logical backup job is not loaded, skipping unsuspend")
-		return nil
-	}
-
-	c.setProcessName("resuming logical backup job")
-
-	patchData := fmt.Sprintf(`{"spec":{"suspend":false}}`)
-	cronJob, err := c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Patch(
-		context.TODO(),
-		c.getLogicalBackupJobName(),
-		types.MergePatchType,
-		[]byte(patchData),
-		metav1.PatchOptions{},
-		"",
-	)
-	if err != nil {
-		return fmt.Errorf("could not resume logical backup job: %w", err)
-	}
-	c.LogicalBackupJob = cronJob
-	c.logger.Info("logical backup job resumed")
-
-	return nil
-}
 
 // GetServiceMaster returns cluster's kubernetes master Service
 func (c *Cluster) GetServiceMaster() *v1.Service {

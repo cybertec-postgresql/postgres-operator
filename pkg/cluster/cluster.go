@@ -1266,101 +1266,46 @@ func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error)
 	return false, nil
 }
 
-// handleHibernateAndWakeUp processes lifecycle hibernate/wake-up transitions.
+// handleHibernateAndWakeUp handles cluster hibernate/wake-up transitions during Update().
+// This is the Update path - it detects the transition, modifies the spec via manageHibernateState,
+// and persists the changes to Kubernetes.
+//
 // Returns (handled bool, err error):
 //   - (true, nil) if lifecycle transition was handled, Update() should return early
 //   - (false, nil) if no lifecycle transition, normal update continues
-//   - (false, error) on error
+//   - (false, error) on error during persistence
+//
+// Flow:
+//  1. Detect action via detectLifecycleTransition()
+//  2. Check for Stopping->Stopped (via detectStoppingCompleted)
+//  3. Call manageHibernateState() to prepare the spec (same logic as Sync path)
+//  4. Persist to Kubernetes via persistHibernateTransition/persistWakeUpTransition
 func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, error) {
-	// === INITIATE HIBERNATE: Running -> Stopping ===
-	if c.Status.Running() && newSpec.Spec.Lifecycle != nil && newSpec.Spec.Lifecycle.Phase == "stopped" {
-		c.logger.Infof("[lifecycle] initiating hibernate for cluster %s: current numberOfInstances=%d", c.Name, c.Spec.NumberOfInstances)
+	action := detectLifecycleTransition(
+		&c.Status,
+		c.Spec.Lifecycle,
+		newSpec.Spec.Lifecycle,
+		newSpec.Spec.NumberOfInstances,
+		newSpec.Status.PreviousNumberOfInstances,
+		c.Status.Running(),
+	)
 
-		// Store previousNumberOfInstances BEFORE setting numberOfInstances to 0
-		newSpec.Status.PreviousNumberOfInstances = c.Spec.NumberOfInstances
-		newSpec.Spec.NumberOfInstances = 0
-		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopping
-
-		// Scale down pooler deployments and store current replica counts
-		if err := c.scalePoolerDown(newSpec); err != nil {
-			return false, fmt.Errorf("could not scale pooler during hibernate: %w", err)
+	if action == LifecycleActionNone {
+		if detectStoppingCompleted(&c.Status, c.getStatefulsetReplicas()) {
+			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
+			return c.persistStoppingCompletedTransition(newSpec)
 		}
-
-		// Suspend logical backup CronJob if enabled
-		if c.Spec.EnableLogicalBackup {
-			if err := c.suspendLogicalBackupJob(); err != nil {
-				return false, fmt.Errorf("could not suspend logical backup job during hibernate: %w", err)
-			}
-			c.logger.Info("[lifecycle] logical backup job suspended")
-		}
-
-		c.logger.Infof("[lifecycle] hibernate initiated: setting numberOfInstances=0, previousNumberOfInstances=%d", newSpec.Status.PreviousNumberOfInstances)
-
-		// Update spec first (Update only updates spec when CR has status subresource)
-		pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
-		if err != nil {
-			return false, fmt.Errorf("could not update spec during hibernate: %w", err)
-		}
-		c.logger.Info("[lifecycle] hibernate: spec updated successfully")
-
-		// Update status separately - preserve status values since UpdatePostgresCR returns object with status zeroed
-		pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
-		pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
-		pgUpdated.Status.PreviousPoolerInstances = newSpec.Status.PreviousPoolerInstances
-
-		pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
-		if err != nil {
-			return false, fmt.Errorf("could not update status during hibernate: %w", err)
-		}
-		c.logger.Infof("[lifecycle] hibernate: status updated successfully, previousNumberOfInstances=%d", pgUpdated.Status.PreviousNumberOfInstances)
-
-		c.setSpec(pgUpdated)
-		return true, nil
+		return false, nil
 	}
 
-	// === WAKE-UP: Stopped -> Running ===
-	if c.Status.Stopped() && (newSpec.Spec.Lifecycle == nil || newSpec.Spec.Lifecycle.Phase != "stopped") {
-		if newSpec.Status.PreviousNumberOfInstances > 0 {
-			c.logger.Infof("[lifecycle] waking up cluster %s: restoring numberOfInstances=%d", c.Name, newSpec.Status.PreviousNumberOfInstances)
+	c.manageHibernateState(c.Postgresql, newSpec)
 
-			// Restore pooler deployments to previous replica counts FIRST
-			if err := c.scalePoolerUp(newSpec); err != nil {
-				return false, fmt.Errorf("could not scale pooler during wake-up: %w", err)
-			}
+	switch action {
+	case LifecycleActionHibernate:
+		return c.persistHibernateTransition(newSpec)
 
-			// Resume logical backup CronJob if enabled
-			if c.Spec.EnableLogicalBackup {
-				if err := c.unsuspendLogicalBackupJob(); err != nil {
-					return false, fmt.Errorf("could not resume logical backup job during wake-up: %w", err)
-				}
-				c.logger.Info("[lifecycle] logical backup job resumed")
-			}
-
-			// Restore numberOfInstances from previousNumberOfInstances
-			newSpec.Spec.NumberOfInstances = newSpec.Status.PreviousNumberOfInstances
-			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
-
-			// Update spec first
-			pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
-			if err != nil {
-				return false, fmt.Errorf("could not update spec during wake-up: %w", err)
-			}
-			c.logger.Info("[lifecycle] wake-up: spec updated successfully")
-
-			// Update status separately, and clear previousNumberOfInstances and previousPoolerInstances after restore
-			pgUpdated.Status.PreviousNumberOfInstances = 0
-			pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
-			pgUpdated.Status.PreviousPoolerInstances = nil
-
-			pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
-			if err != nil {
-				return false, fmt.Errorf("could not update status during wake-up: %w", err)
-			}
-			c.logger.Info("[lifecycle] wake-up: status updated successfully, previousNumberOfInstances cleared")
-
-			c.setSpec(pgUpdated)
-			return true, nil
-		}
+	case LifecycleActionWakeUp:
+		return c.persistWakeUpTransition(newSpec)
 	}
 
 	return false, nil

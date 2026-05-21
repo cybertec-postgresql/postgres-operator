@@ -557,12 +557,14 @@ func TestHandleHibernateAndWakeUp_Hibernate(t *testing.T) {
 			wantErr:    false,
 		},
 		{
-			name:               "Stopped + lifecycle cleared - no-op (Update handles this)",
+			name:               "Stopped + lifecycle cleared - initiates wake-up",
 			currentStatus:      "Stopped",
 			numberOfInstances:  0,
 			lifecyclePhase:      "",
-			wantHandled: false, // handleHibernateAndWakeUp doesn't handle wake-up, that's done via Update flow
-			wantErr:    false,
+			k8sUpdateSucceeds:  true,
+			k8sStatusSucceeds:  true,
+			wantHandled:         true,
+			wantErr:             false,
 		},
 	}
 
@@ -661,12 +663,14 @@ func TestHandleHibernateAndWakeUp_WakeUp(t *testing.T) {
 			wantErr:                false,
 		},
 		{
-			name:                   "Stopped + previousNumberOfInstances is 0",
+			name:                   "Stopped + previousNumberOfInstances is 0 - still initiates wake-up",
 			currentStatus:          "Stopped",
 			numberOfInstances:      0,
 			previousNumberOfInst:    0,
 			lifecyclePhase:          "",
-			wantHandled:            false, // No restore possible
+			k8sUpdateSucceeds:      true,
+			k8sStatusSucceeds:      true,
+			wantHandled:            true,
 			wantErr:                false,
 		},
 		{
