@@ -17,38 +17,30 @@ import (
 type LifecycleAction int
 
 const (
-	LifecycleActionNone LifecycleAction = iota
-	LifecycleActionHibernate          // Running -> Stopping (initiate hibernate)
-	LifecycleActionStoppingCompleted // Stopping -> Stopped (pods fully terminated)
-	LifecycleActionWakeUp            // Stopped -> Updating (initiate wake-up)
+	LifecycleActionNone              LifecycleAction = iota
+	LifecycleActionHibernate                         // Running -> Stopping (initiate hibernate)
+	LifecycleActionStoppingCompleted                 // Stopping -> Stopped (pods fully terminated)
+	LifecycleActionWakeUp                            // Stopped -> Updating (initiate wake-up)
 )
 
 // detectLifecycleTransition is a pure function that examines the current and proposed specs
 // and determines what lifecycle action (if any) should be taken.
 //
 // Detection logic:
-//   - Hibernate: Running status + lifecycle.phase="stopped" + not already stopping/stopped
-//   - Wake-up: Stopped status + lifecycle.phase cleared + (previousNumberOfInstances > 0 OR isWakingUp flag)
-//   - isWakingUp flag is set when old spec was Running, new status is Updating, and lifecycle is cleared
+//   - Hibernate: lifecycle.phase="stopped" + status not Stopping or Stopped
+//   - Wake-up: (status == Stopped OR lifecycle cleared + has previousNumberOfInstances
+//   - numberOfInstances == 0) AND new lifecycle is cleared (or nil)
 func detectLifecycleTransition(
 	currentStatus *acidv1.PostgresStatus,
-	oldSpecLifecycle *acidv1.LifecycleSpec,
 	newSpecLifecycle *acidv1.LifecycleSpec,
 	newSpecNumberOfInstances int32,
 	newSpecPreviousNumberOfInstances int32,
-	oldSpecStatusRunning bool,
 ) LifecycleAction {
 	isWakingUpSimple := newSpecLifecycle == nil || newSpecLifecycle.Phase != "stopped"
 	hasPreviousInstances := newSpecPreviousNumberOfInstances > 0
 	needsRestore := newSpecNumberOfInstances == 0
 
-	// Detect wake-up by checking if Update() set status to Updating before Sync() runs
-	isWakingUp := oldSpecStatusRunning &&
-		currentStatus.PostgresClusterStatus == acidv1.ClusterStatusUpdating &&
-		(newSpecLifecycle == nil || newSpecLifecycle.Phase != "stopped")
-
-	// Also detect wake-up by simple conditions: lifecycle cleared + has previous + needs restore
-	isWakingUp = isWakingUp || (isWakingUpSimple && hasPreviousInstances && needsRestore)
+	isWakingUp := isWakingUpSimple && hasPreviousInstances && needsRestore
 
 	if currentStatus.Stopped() || isWakingUp {
 		if isWakingUp || newSpecLifecycle == nil || newSpecLifecycle.Phase != "stopped" {
@@ -171,6 +163,8 @@ func (c *Cluster) persistWakeUpTransition(newSpec *acidv1.Postgresql) (bool, err
 		return false, fmt.Errorf("could not update spec during wake-up: %w", err)
 	}
 
+	pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
+	pgUpdated.Status.PreviousPoolerInstances = newSpec.Status.PreviousPoolerInstances
 	pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
 
 	pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
@@ -200,48 +194,47 @@ func (c *Cluster) persistStoppingCompletedTransition(newSpec *acidv1.Postgresql)
 }
 
 // manageHibernateState handles cluster hibernate/wake-up state transitions during Sync().
-// This is the Sync path - it only modifies the in-memory spec and returns a boolean
-// indicating whether sync should continue or return early.
+// This is the Sync path - it only modifies the in-memory spec.
 //
 // State transitions handled:
 //   - Running -> Stopping: Via initiateHibernate() (when lifecycle.phase="stopped")
 //   - Stopping -> Stopped: When StatefulSet replicas reach 0 (detected here)
 //   - Stopped -> Updating: Via initiateWakeUp() (when lifecycle cleared)
 //
-// Returns true if sync should continue, false if it should return early.
-func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv1.Postgresql) bool {
+// Returns the detected LifecycleAction and a boolean indicating whether sync
+// should continue (true) or return early (false, only when cluster is Stopped
+// with lifecycle.phase="stopped" set).
+func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv1.Postgresql) (LifecycleAction, bool) {
 	action := detectLifecycleTransition(
 		&newSpec.Status,
-		oldSpec.Spec.Lifecycle,
 		newSpec.Spec.Lifecycle,
 		newSpec.Spec.NumberOfInstances,
 		newSpec.Status.PreviousNumberOfInstances,
-		oldSpec.Status.Running(),
 	)
 
 	switch action {
 	case LifecycleActionHibernate:
 		c.initiateHibernate(newSpec)
-		return true
+		return action, true
 
 	case LifecycleActionWakeUp:
 		c.initiateWakeUp(newSpec)
-		return true
+		return action, true
 	}
 
 	// Check if Stopping -> Stopped transition is needed
 	if detectStoppingCompleted(&newSpec.Status, c.getStatefulsetReplicas()) {
 		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
 		c.logger.Info("[lifecycle] cluster has stopped, all pods are terminated")
-		return true
+		return LifecycleActionStoppingCompleted, true
 	}
 
 	// Skip sync if cluster is stopped and lifecycle.phase="stopped" is set
 	if newSpec.Status.Stopped() && newSpec.Spec.Lifecycle != nil && newSpec.Spec.Lifecycle.Phase == "stopped" {
-		return false
+		return LifecycleActionNone, false
 	}
 
-	return true
+	return LifecycleActionNone, true
 }
 
 // getStatefulsetReplicas returns the current replica count from the StatefulSet.
@@ -412,3 +405,4 @@ func (c *Cluster) patchPoolerReplicas(role PostgresRole, replicas int32) error {
 	}
 	return nil
 }
+

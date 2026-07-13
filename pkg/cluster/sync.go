@@ -66,8 +66,24 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 	}
 
 	// Handle lifecycle hibernate/wake-up state transitions
-	if !c.manageHibernateState(oldSpec, newSpec) {
+	lifecycleAction, continueSync := c.manageHibernateState(oldSpec, newSpec)
+	if !continueSync {
 		return nil
+	}
+
+	// Hibernate and WakeUp transitions modify newSpec (e.g. numberOfInstances).
+	// Persist them here so the cluster actually scales. Without this, a Sync
+	// that runs before any Update (e.g. operator restart catching up via the
+	// informer cache) would leave the spec unchanged in the API and the cluster
+	// would stay stuck in Stopping/Updating because no scaling occurs.
+	if lifecycleAction == LifecycleActionHibernate || lifecycleAction == LifecycleActionWakeUp {
+		pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
+		if err != nil {
+			c.logger.Errorf("could not update spec after lifecycle transition in sync: %v", err)
+			return err
+		}
+		c.setSpec(pgUpdated)
+		newSpec = pgUpdated
 	}
 
 	if err = c.initUsers(); err != nil {

@@ -1017,13 +1017,6 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		return nil
 	}
 
-	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
-
-	newSpec, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
-	if err != nil {
-		return fmt.Errorf("could not set cluster status to updating: %w", err)
-	}
-
 	// Handle lifecycle transitions (hibernate/wake-up)
 	handled, err := c.handleHibernateAndWakeUp(newSpec)
 	if err != nil {
@@ -1033,6 +1026,24 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		return nil
 	}
 
+	// If a previous Update already set a lifecycle status (e.g. persistWakeUpTransition
+	// wrote Updating), do not clobber it. The watch event that triggered this Update
+	// is a follow-up from the operator's own persistXxxTransition write, so the
+	// status subresource is already at the correct value, and writing again with
+	// this stale newSpec.resourceVersion would cause a 409 Conflict.
+	isLifecycleActive := newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusUpdating ||
+		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopping ||
+		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopped
+
+	if !isLifecycleActive {
+		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
+
+		newSpec, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
+		if err != nil {
+			return fmt.Errorf("could not set cluster status to updating: %w", err)
+		}
+	}
+
 	if !c.isInMaintenanceWindow(newSpec.Spec.MaintenanceWindows) {
 		// do not apply any major version related changes yet
 		newSpec.Spec.PostgresqlParam.PgVersion = oldSpec.Spec.PostgresqlParam.PgVersion
@@ -1040,6 +1051,12 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	c.setSpec(newSpec)
 
 	defer func() {
+		if isLifecycleActive {
+			// Status was set by a previous Update (persistXxxTransition); do not
+			// overwrite Updating/Stopping/Stopped back to Running. Sync's defer
+			// will transition to Running once the cluster is ready.
+			return
+		}
 		currentStatus := newSpec.Status.DeepCopy()
 		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusRunning
 
@@ -1283,11 +1300,9 @@ func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error)
 func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, error) {
 	action := detectLifecycleTransition(
 		&c.Status,
-		c.Spec.Lifecycle,
 		newSpec.Spec.Lifecycle,
 		newSpec.Spec.NumberOfInstances,
 		newSpec.Status.PreviousNumberOfInstances,
-		c.Status.Running(),
 	)
 
 	if action == LifecycleActionNone {

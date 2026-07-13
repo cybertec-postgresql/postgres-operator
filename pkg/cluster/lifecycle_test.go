@@ -490,7 +490,7 @@ func TestManageHibernateState(t *testing.T) {
 				}
 			}
 
-			gotContinue := c.manageHibernateState(oldSpec, newSpec)
+			_, gotContinue := c.manageHibernateState(oldSpec, newSpec)
 
 			assert.Equal(t, tt.wantContinue, gotContinue)
 
@@ -877,7 +877,7 @@ func TestLifecycleStateTransitions(t *testing.T) {
 		}
 
 		// Step 1: manageHibernateState should initiate hibernate
-		continueSync := c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances)
 		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
@@ -912,7 +912,7 @@ func TestLifecycleStateTransitions(t *testing.T) {
 		}
 
 		// Step 1: manageHibernateState should restore
-		continueSync := c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
 		assert.Equal(t, "Updating", newSpec.Status.PostgresClusterStatus)
@@ -1147,7 +1147,7 @@ func TestManageHibernateState_EdgeCases(t *testing.T) {
 				}
 			}
 
-			gotContinue := c.manageHibernateState(oldSpec, newSpec)
+			_, gotContinue := c.manageHibernateState(oldSpec, newSpec)
 
 			assert.Equal(t, tt.wantContinue, gotContinue, "continue sync mismatch")
 			if tt.wantNumberOfInstances != nil {
@@ -1178,7 +1178,7 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Running"},
 		}
 
-		continueSync := c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances)
 		assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances)
@@ -1192,12 +1192,12 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 		}
 		newSpec.Status.PostgresClusterStatus = "Stopping"
 
-		continueSync = c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
 
 		c.Statefulset.Spec.Replicas = int32Ptr(0)
-		continueSync = c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, "Stopped", newSpec.Status.PostgresClusterStatus)
 	})
@@ -1223,7 +1223,7 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 			},
 		}
 
-		continueSync := c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
 		assert.Equal(t, "Updating", newSpec.Status.PostgresClusterStatus)
@@ -1233,7 +1233,7 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 		}
 		newSpec.Status.PostgresClusterStatus = "Updating"
 
-		continueSync = c.manageHibernateState(oldSpec, newSpec)
+		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
 	})
