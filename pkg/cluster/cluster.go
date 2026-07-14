@@ -1306,7 +1306,11 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 	)
 
 	if action == LifecycleActionNone {
-		if detectStoppingCompleted(&c.Status, c.getStatefulsetReplicas()) {
+		done, err := c.checkStoppingCompleted(&c.Status)
+		if err != nil {
+			return false, fmt.Errorf("could not check stopping completed: %w", err)
+		}
+		if done {
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
 			return c.persistStoppingCompletedTransition(newSpec)
 		}

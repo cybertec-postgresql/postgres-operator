@@ -450,6 +450,25 @@ func TestManageHibernateState(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
+
+			if tt.statefulsetReplicas != nil {
+				_, err := clientSet.AppsV1().StatefulSets("default").Create(
+					context.TODO(),
+					&appsv1.StatefulSet{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-cluster",
+							Namespace: "default",
+						},
+						Spec: appsv1.StatefulSetSpec{
+							Replicas: tt.statefulsetReplicas,
+						},
+					},
+					metav1.CreateOptions{},
+				)
+				assert.NoError(t, err)
+			}
+
 			c := &Cluster{
 				logger: lifecycleLogger,
 				Postgresql: acidv1.Postgresql{
@@ -458,14 +477,7 @@ func TestManageHibernateState(t *testing.T) {
 						Namespace: "default",
 					},
 				},
-			}
-
-			if tt.statefulsetReplicas != nil {
-				c.Statefulset = &appsv1.StatefulSet{
-					Spec: appsv1.StatefulSetSpec{
-						Replicas: tt.statefulsetReplicas,
-					},
-				}
+				KubeClient: *kubeClient,
 			}
 
 			oldSpec := acidv1.Postgresql{
@@ -1107,8 +1119,28 @@ func TestManageHibernateState_EdgeCases(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
+
+			if tt.statefulsetReplicas != nil {
+				_, err := clientSet.AppsV1().StatefulSets("default").Create(
+					context.TODO(),
+					&appsv1.StatefulSet{
+						ObjectMeta: metav1.ObjectMeta{
+							Name:      "test-cluster",
+							Namespace: "default",
+						},
+						Spec: appsv1.StatefulSetSpec{
+							Replicas: tt.statefulsetReplicas,
+						},
+					},
+					metav1.CreateOptions{},
+				)
+				assert.NoError(t, err)
+			}
+
 			c := &Cluster{
-				logger: lifecycleLogger,
+				logger:     lifecycleLogger,
+				KubeClient: *kubeClient,
 				Postgresql: acidv1.Postgresql{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test-cluster",
@@ -1160,8 +1192,20 @@ func TestManageHibernateState_EdgeCases(t *testing.T) {
 
 func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 	t.Run("Running -> Stopping -> Stopped sequence", func(t *testing.T) {
+		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(
+			context.TODO(),
+			&appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
+				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
+			},
+			metav1.CreateOptions{},
+		)
+		assert.NoError(t, err)
+
 		c := &Cluster{
-			logger: lifecycleLogger,
+			logger:     lifecycleLogger,
+			KubeClient: *kubeClient,
 			Postgresql: acidv1.Postgresql{
 				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
 			},
@@ -1184,9 +1228,13 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 		assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances)
 		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
 
-		c.Statefulset = &appsv1.StatefulSet{
-			Spec: appsv1.StatefulSetSpec{Replicas: int32Ptr(2)},
-		}
+		// Simulate STS still terminating (replicas=2)
+		sset, err := clientSet.AppsV1().StatefulSets("default").Get(context.TODO(), "test", metav1.GetOptions{})
+		assert.NoError(t, err)
+		sset.Spec.Replicas = int32Ptr(2)
+		_, err = clientSet.AppsV1().StatefulSets("default").Update(context.TODO(), sset, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+
 		oldSpec = acidv1.Postgresql{
 			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Stopping"},
 		}
@@ -1196,7 +1244,13 @@ func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
 		assert.True(t, continueSync)
 		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
 
-		c.Statefulset.Spec.Replicas = int32Ptr(0)
+		// Simulate STS scaled to 0
+		sset, err = clientSet.AppsV1().StatefulSets("default").Get(context.TODO(), "test", metav1.GetOptions{})
+		assert.NoError(t, err)
+		sset.Spec.Replicas = int32Ptr(0)
+		_, err = clientSet.AppsV1().StatefulSets("default").Update(context.TODO(), sset, metav1.UpdateOptions{})
+		assert.NoError(t, err)
+
 		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
 		assert.True(t, continueSync)
 		assert.Equal(t, "Stopped", newSpec.Status.PostgresClusterStatus)
@@ -1427,4 +1481,152 @@ func TestUnsuspendLogicalBackupJob(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRefreshStatefulset(t *testing.T) {
+	const stsName = "test-cluster"
+
+	makeSTS := func(replicas *int32) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
+			Spec:       appsv1.StatefulSetSpec{Replicas: replicas},
+		}
+	}
+
+	makeCluster := func(t *testing.T) (*Cluster, *fake.Clientset) {
+		t.Helper()
+		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
+		return &Cluster{
+			logger:     lifecycleLogger,
+			KubeClient: *kubeClient,
+			Postgresql: acidv1.Postgresql{
+				ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
+			},
+		}, clientSet
+	}
+
+	t.Run("success: populates cache from API when c.Statefulset is nil", func(t *testing.T) {
+		c, clientSet := makeCluster(t)
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		assert.Nil(t, c.Statefulset)
+
+		assert.NoError(t, c.refreshStatefulset())
+		assert.NotNil(t, c.Statefulset)
+		assert.Equal(t, stsName, c.Statefulset.Name)
+		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas)
+	})
+
+	t.Run("success: overwrites stale cache with fresh API value", func(t *testing.T) {
+		c, clientSet := makeCluster(t)
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		// Stale cache says replicas=3
+		c.Statefulset = makeSTS(int32Ptr(3))
+
+		assert.NoError(t, c.refreshStatefulset())
+		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas, "should reflect API value, not cached value")
+	})
+
+	t.Run("not found: clears cache and returns nil", func(t *testing.T) {
+		c, _ := makeCluster(t)
+		c.Statefulset = makeSTS(int32Ptr(2)) // stale cache
+		assert.NotNil(t, c.Statefulset)
+
+		assert.NoError(t, c.refreshStatefulset())
+		assert.Nil(t, c.Statefulset, "cache should be cleared when STS is missing")
+	})
+
+	t.Run("not found from nil: leaves cache nil, returns nil", func(t *testing.T) {
+		c, _ := makeCluster(t)
+		assert.Nil(t, c.Statefulset)
+
+		assert.NoError(t, c.refreshStatefulset())
+		assert.Nil(t, c.Statefulset)
+	})
+}
+
+func TestCheckStoppingCompleted(t *testing.T) {
+	const stsName = "test-cluster"
+
+	makeSTS := func(replicas *int32) *appsv1.StatefulSet {
+		return &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
+			Spec:       appsv1.StatefulSetSpec{Replicas: replicas},
+		}
+	}
+
+	makeCluster := func(t *testing.T) (*Cluster, *fake.Clientset) {
+		t.Helper()
+		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
+		return &Cluster{
+			logger:     lifecycleLogger,
+			KubeClient: *kubeClient,
+			Postgresql: acidv1.Postgresql{
+				ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
+			},
+		}, clientSet
+	}
+
+	stoppingStatus := acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusStopping}
+	runningStatus := acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning}
+
+	t.Run("fast path: status not Stopping returns false without touching cache", func(t *testing.T) {
+		c, _ := makeCluster(t)
+		// Pre-populate cache to prove it's not refreshed
+		c.Statefulset = makeSTS(int32Ptr(0))
+
+		done, err := c.checkStoppingCompleted(&runningStatus)
+		assert.NoError(t, err)
+		assert.False(t, done)
+		assert.NotNil(t, c.Statefulset, "fast path should not refresh the cache")
+	})
+
+	t.Run("Stopping with API replicas=0 returns true (operator-restart scenario)", func(t *testing.T) {
+		c, clientSet := makeCluster(t)
+		// Operator just restarted: c.Statefulset is nil.
+		// API has the truth: replicas=0.
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		assert.Nil(t, c.Statefulset)
+
+		done, err := c.checkStoppingCompleted(&stoppingStatus)
+		assert.NoError(t, err)
+		assert.True(t, done, "should transition to Stopped based on fresh API value")
+		assert.NotNil(t, c.Statefulset, "cache should be populated after refresh")
+	})
+
+	t.Run("Stopping with API replicas=2 returns false", func(t *testing.T) {
+		c, clientSet := makeCluster(t)
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(2)), metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		done, err := c.checkStoppingCompleted(&stoppingStatus)
+		assert.NoError(t, err)
+		assert.False(t, done)
+	})
+
+	t.Run("Stopping with stale cache (replicas=2) but API says 0 returns true", func(t *testing.T) {
+		c, clientSet := makeCluster(t)
+		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
+		assert.NoError(t, err)
+		// Stale cache says replicas=2 (e.g. another operator pod restarted and
+		// cached the pre-hibernate state).
+		c.Statefulset = makeSTS(int32Ptr(2))
+
+		done, err := c.checkStoppingCompleted(&stoppingStatus)
+		assert.NoError(t, err)
+		assert.True(t, done, "should use fresh API value, not stale cache")
+		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas)
+	})
+
+	t.Run("Stopping with STS missing in API returns false", func(t *testing.T) {
+		c, _ := makeCluster(t)
+		c.Statefulset = makeSTS(int32Ptr(2))
+
+		done, err := c.checkStoppingCompleted(&stoppingStatus)
+		assert.NoError(t, err)
+		assert.False(t, done)
+		assert.Nil(t, c.Statefulset, "cache should be cleared when STS is missing")
+	})
 }

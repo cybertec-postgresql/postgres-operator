@@ -9,6 +9,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
+	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
 )
 
 // LifecycleAction represents the detected lifecycle transition for a cluster.
@@ -68,6 +69,42 @@ func detectStoppingCompleted(currentStatus *acidv1.PostgresStatus, statefulsetRe
 		return false
 	}
 	return *statefulsetReplicas == 0
+}
+
+// refreshStatefulset fetches the latest StatefulSet from the API and updates c.Statefulset.
+// The in-memory c.Statefulset cache is only populated by Create() and by Sync() inside
+// syncStatefulSet(); after an operator restart the cache is nil, and Sync() calls
+// manageHibernateState before reaching syncStatefulSet(). Without this refresh,
+// detectStoppingCompleted would see stale (or nil) replica counts and never transition
+// to Stopped. If the StatefulSet is not found in the API, the cache is cleared and
+// nil is returned (the cluster may have been deleted).
+func (c *Cluster) refreshStatefulset() error {
+	sset, err := c.KubeClient.StatefulSets(c.Namespace).Get(
+		context.TODO(), c.statefulSetName(), metav1.GetOptions{})
+	if err != nil {
+		if k8sutil.ResourceNotFound(err) {
+			c.Statefulset = nil
+			return nil
+		}
+		return fmt.Errorf("could not refresh statefulset: %w", err)
+	}
+	c.Statefulset = sset
+	return nil
+}
+
+// checkStoppingCompleted is an I/O wrapper around detectStoppingCompleted. It refreshes
+// the StatefulSet cache before delegating so callers see fresh replica counts, especially
+// after an operator restart where c.Statefulset is nil. To avoid an extra API call on the
+// hot Update/Sync path, the refresh is skipped when status is not Stopping (the only
+// state where detectStoppingCompleted can return true).
+func (c *Cluster) checkStoppingCompleted(currentStatus *acidv1.PostgresStatus) (bool, error) {
+	if !currentStatus.Stopping() {
+		return false, nil
+	}
+	if err := c.refreshStatefulset(); err != nil {
+		return false, err
+	}
+	return detectStoppingCompleted(currentStatus, c.getStatefulsetReplicas()), nil
 }
 
 // initiateHibernate prepares the cluster for hibernation by:
@@ -223,7 +260,13 @@ func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv
 	}
 
 	// Check if Stopping -> Stopped transition is needed
-	if detectStoppingCompleted(&newSpec.Status, c.getStatefulsetReplicas()) {
+	done, err := c.checkStoppingCompleted(&newSpec.Status)
+	if err != nil {
+		// Refresh failed; treat as not-completed and let the next Sync retry.
+		// Not returning the error so we don't mark the cluster SyncFailed on a
+		// transient API hiccup while the cluster is mid-stop.
+		c.logger.Warningf("[lifecycle] could not refresh statefulset for stopping check: %v", err)
+	} else if done {
 		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
 		c.logger.Info("[lifecycle] cluster has stopped, all pods are terminated")
 		return LifecycleActionStoppingCompleted, true
