@@ -36,10 +36,26 @@ var requirePrimaryRestartWhenDecreased = []string{
 // Sync syncs the cluster, making sure the actual Kubernetes objects correspond to what is defined in the manifest.
 // Unlike the update, sync does not error out if some objects do not exist and takes care of creating them.
 func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
-	var err error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	// operator-restart recovery for an in-flight hibernate. If the persisted
+	// status is Stopping but pods have not yet been confirmed gone, complete the
+	// transition inline. Lives at the Sync level so the existing defer's SyncFailed
+	// branch doesn't fire on the lifecycle wait timeout.
+	if c.Status.Stopping() {
+		return c.completeStoppingTransition(newSpec)
+	}
+
+	return c.syncStateLocked(newSpec)
+}
+
+// syncStateLocked performs reconciliation. The caller must hold c.mu. Detects
+// lifecycle transitions in-memory and persists spec mutations before running
+// the sync body, so a single call covers both lifecycle transitions (called
+// from handleHibernateAndWakeUp) and periodic reconciliation.
+func (c *Cluster) syncStateLocked(newSpec *acidv1.Postgresql) error {
+	var err error
 	oldSpec := c.Postgresql
 	c.setSpec(newSpec)
 
@@ -47,7 +63,13 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		if err != nil {
 			c.logger.Warningf("error while syncing cluster state: %v", err)
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusSyncFailed
-		} else if !c.Status.Running() && !c.Status.Stopping() && !c.Status.Stopped() {
+		} else if !c.Status.Running() && !c.Status.Stopping() && !c.Status.Stopped() &&
+			oldSpec.Spec.NumberOfInstances > 0 {
+			// Wake-up Updates carry oldSpec.Spec.NumberOfInstances == 0 because
+			// initiateWakeUp hasn't mutated newSpec yet when oldSpec was captured
+			// Skip the Updating->Running transition here: the cluster
+			// isn't ready (pods are still starting), the write would 409 on stale
+			// rv, and the next periodic Sync writes Running with fresh rv.
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusRunning
 		}
 
@@ -65,25 +87,20 @@ func (c *Cluster) Sync(newSpec *acidv1.Postgresql) error {
 		c.logger.Debugf("could not sync finalizers: %v", err)
 	}
 
-	// Handle lifecycle hibernate/wake-up state transitions
-	lifecycleAction, continueSync := c.manageHibernateState(oldSpec, newSpec)
-	if !continueSync {
+	// Lifecycle handling lives in its own helper; syncStateLocked only does
+	// reconciliation work from here on.
+	proceed, perr := c.prepareLifecycleTransition(&newSpec, oldSpec)
+	if perr != nil {
+		return perr
+	}
+	if !proceed {
 		return nil
 	}
 
-	// Hibernate and WakeUp transitions modify newSpec (e.g. numberOfInstances).
-	// Persist them here so the cluster actually scales. Without this, a Sync
-	// that runs before any Update (e.g. operator restart catching up via the
-	// informer cache) would leave the spec unchanged in the API and the cluster
-	// would stay stuck in Stopping/Updating because no scaling occurs.
-	if lifecycleAction == LifecycleActionHibernate || lifecycleAction == LifecycleActionWakeUp {
-		pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
-		if err != nil {
-			c.logger.Errorf("could not update spec after lifecycle transition in sync: %v", err)
-			return err
-		}
-		c.setSpec(pgUpdated)
-		newSpec = pgUpdated
+	// If prepareLifecycleTransition already persisted Stopping/Updating, resync
+	// oldSpec so the defer below doesn't redundantly re-write the same status (409).
+	if newSpec.Status.PostgresClusterStatus != oldSpec.Status.PostgresClusterStatus {
+		oldSpec.Status = *newSpec.Status.DeepCopy()
 	}
 
 	if err = c.initUsers(); err != nil {

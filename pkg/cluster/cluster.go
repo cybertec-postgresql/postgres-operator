@@ -1026,11 +1026,10 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		return nil
 	}
 
-	// If a previous Update already set a lifecycle status (e.g. persistWakeUpTransition
-	// wrote Updating), do not clobber it. The watch event that triggered this Update
-	// is a follow-up from the operator's own persistXxxTransition write, so the
-	// status subresource is already at the correct value, and writing again with
-	// this stale newSpec.resourceVersion would cause a 409 Conflict.
+	// If a previous Update already set a lifecycle status do not clobber it.
+	// The watch event that triggered this Update is a follow-up from the operator's
+	// write, so the status subresource is already at the correct value, and writing again
+	// would cause a 409 Conflict.
 	isLifecycleActive := newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusUpdating ||
 		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopping ||
 		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopped
@@ -1048,13 +1047,23 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		// do not apply any major version related changes yet
 		newSpec.Spec.PostgresqlParam.PgVersion = oldSpec.Spec.PostgresqlParam.PgVersion
 	}
-	c.setSpec(newSpec)
+
+	// When isLifecycleActive, the watch delivered newSpec with a status from
+	// BEFORE our latest status write (e.g. status=Updating while c.Status is
+	// already Running). Clobbering c.Status with the stale value would break
+	// the next Update's blockLifecycleUpdate check — preserve the authoritative
+	// c.Status, only refresh the spec fields.
+	if !isLifecycleActive {
+		c.setSpec(newSpec)
+	} else {
+		cached, _ := c.GetSpec()
+		cached.Spec = newSpec.Spec
+		c.setSpec(cached)
+	}
 
 	defer func() {
 		if isLifecycleActive {
-			// Status was set by a previous Update (persistXxxTransition); do not
-			// overwrite Updating/Stopping/Stopped back to Running. Sync's defer
-			// will transition to Running once the cluster is ready.
+			// Status was set by a previous Update; sync's defer will take care
 			return
 		}
 		currentStatus := newSpec.Status.DeepCopy()
@@ -1278,53 +1287,6 @@ func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error)
 	// During Stopped: only block if keeping lifecycle.phase="stopped"
 	if lifecyclePhase == "stopped" {
 		return true, fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase to wake up the cluster")
-	}
-
-	return false, nil
-}
-
-// handleHibernateAndWakeUp handles cluster hibernate/wake-up transitions during Update().
-// This is the Update path - it detects the transition, modifies the spec via manageHibernateState,
-// and persists the changes to Kubernetes.
-//
-// Returns (handled bool, err error):
-//   - (true, nil) if lifecycle transition was handled, Update() should return early
-//   - (false, nil) if no lifecycle transition, normal update continues
-//   - (false, error) on error during persistence
-//
-// Flow:
-//  1. Detect action via detectLifecycleTransition()
-//  2. Check for Stopping->Stopped (via detectStoppingCompleted)
-//  3. Call manageHibernateState() to prepare the spec (same logic as Sync path)
-//  4. Persist to Kubernetes via persistHibernateTransition/persistWakeUpTransition
-func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, error) {
-	action := detectLifecycleTransition(
-		&c.Status,
-		newSpec.Spec.Lifecycle,
-		newSpec.Spec.NumberOfInstances,
-		newSpec.Status.PreviousNumberOfInstances,
-	)
-
-	if action == LifecycleActionNone {
-		done, err := c.checkStoppingCompleted(&c.Status)
-		if err != nil {
-			return false, fmt.Errorf("could not check stopping completed: %w", err)
-		}
-		if done {
-			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
-			return c.persistStoppingCompletedTransition(newSpec)
-		}
-		return false, nil
-	}
-
-	c.manageHibernateState(c.Postgresql, newSpec)
-
-	switch action {
-	case LifecycleActionHibernate:
-		return c.persistHibernateTransition(newSpec)
-
-	case LifecycleActionWakeUp:
-		return c.persistWakeUpTransition(newSpec)
 	}
 
 	return false, nil

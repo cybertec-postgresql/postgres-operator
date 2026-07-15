@@ -25,40 +25,6 @@ var lifecycleEventRecorder = record.NewFakeRecorder(10)
 
 func int32Ptr(i int32) *int32 { return &i }
 
-func newTestLifecycleCluster(status string, numberOfInstances int32, lifecyclePhase string) *Cluster {
-	pg := acidv1.Postgresql{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "test-cluster",
-			Namespace: "default",
-		},
-		Spec: acidv1.PostgresSpec{
-			TeamID:           "test-team",
-			NumberOfInstances: numberOfInstances,
-			Volume:           acidv1.Volume{Size: "1Gi"},
-		},
-		Status: acidv1.PostgresStatus{
-			PostgresClusterStatus: status,
-		},
-	}
-
-	if lifecyclePhase != "" {
-		pg.Spec.Lifecycle = &acidv1.LifecycleSpec{
-			Phase: lifecyclePhase,
-		}
-	}
-
-	return &Cluster{
-		Config: Config{
-			OpConfig: config.Config{
-				PodManagementPolicy: "ordered_ready",
-			},
-		},
-		Postgresql: pg,
-		logger:     lifecycleLogger,
-		eventRecorder: lifecycleEventRecorder,
-	}
-}
-
 func newTestPoolerObjects(role PostgresRole, replicas int32) *ConnectionPoolerObjects {
 	return &ConnectionPoolerObjects{
 		Deployment: &appsv1.Deployment{
@@ -82,46 +48,404 @@ func newFakeK8sClientForLifecycle() (*k8sutil.KubernetesClient, *fake.Clientset,
 	acidClientSet := fakeacidv1.NewSimpleClientset()
 
 	client := &k8sutil.KubernetesClient{
-		DeploymentsGetter:  clientSet.AppsV1(),
-		PostgresqlsGetter:  acidClientSet.AcidV1(),
-		StatefulSetsGetter: clientSet.AppsV1(),
-		ServicesGetter:     clientSet.CoreV1(),
-		SecretsGetter:      clientSet.CoreV1(),
+		DeploymentsGetter:   clientSet.AppsV1(),
+		PostgresqlsGetter:   acidClientSet.AcidV1(),
+		StatefulSetsGetter:  clientSet.AppsV1(),
+		ServicesGetter:      clientSet.CoreV1(),
+		SecretsGetter:       clientSet.CoreV1(),
 		ConfigMapsGetter:    clientSet.CoreV1(),
-		PodsGetter:         clientSet.CoreV1(),
-		EndpointsGetter:    clientSet.CoreV1(),
+		PodsGetter:          clientSet.CoreV1(),
+		EndpointsGetter:     clientSet.CoreV1(),
+		CronJobsGetter:      clientSet.BatchV1(),
 	}
 
 	return client, clientSet, acidClientSet
 }
 
-func createTestPostgresqlInClient(client *k8sutil.KubernetesClient, name, namespace string, spec *acidv1.PostgresSpec, status *acidv1.PostgresStatus) *acidv1.Postgresql {
+// newLifecycleCluster builds a Cluster with the given current status and spec
+// snapshot. The Postgres CR is pre-created in the fake clientset so K8s API
+// calls work without a separate Create step.
+func newLifecycleCluster(
+	client *k8sutil.KubernetesClient,
+	status string,
+	numberOfInstances int32,
+	lifecyclePhase string,
+	previousNumberOfInstances int32,
+	previousPoolerInstances map[string]int32,
+) *Cluster {
 	pg := &acidv1.Postgresql{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+		Spec: acidv1.PostgresSpec{
+			TeamID:            "test-team",
+			NumberOfInstances: numberOfInstances,
+			Volume:            acidv1.Volume{Size: "1Gi"},
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus: status,
 		},
 	}
-	if spec != nil {
-		pg.Spec = *spec
+	if lifecyclePhase != "" {
+		pg.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: lifecyclePhase}
 	}
-	if status != nil {
-		pg.Status = *status
+	if previousNumberOfInstances > 0 {
+		pg.Status.PreviousNumberOfInstances = previousNumberOfInstances
+	}
+	if previousPoolerInstances != nil {
+		pg.Status.PreviousPoolerInstances = previousPoolerInstances
 	}
 
-	created, err := client.Postgresqls(namespace).Create(context.TODO(), pg, metav1.CreateOptions{})
-	if err == nil {
-		return created
+	created, err := client.Postgresqls("default").Create(context.TODO(), pg, metav1.CreateOptions{})
+	if err != nil {
+		panic(fmt.Sprintf("failed to pre-create Postgresql: %v", err))
 	}
-	return pg
+
+	return &Cluster{
+		Config: Config{
+			OpConfig: config.Config{
+				PodManagementPolicy:    "ordered_ready",
+				LogicalBackup: config.LogicalBackup{
+					LogicalBackupJobPrefix: "logical-backup-",
+				},
+			},
+		},
+		Postgresql:    *created,
+		KubeClient:    *client,
+		logger:        lifecycleLogger,
+		eventRecorder: lifecycleEventRecorder,
+	}
 }
 
-func updatePostgresqlInClient(client *k8sutil.KubernetesClient, pg *acidv1.Postgresql) (*acidv1.Postgresql, error) {
-	return client.Postgresqls(pg.Namespace).Update(context.TODO(), pg, metav1.UpdateOptions{})
+func TestDetectLifecycleTransition(t *testing.T) {
+	tests := []struct {
+		name                         string
+		currentStatus                string
+		newLifecyclePhase            string // "" means nil lifecycle
+		newNumberOfInstances         int32
+		newPreviousNumberOfInstances int32
+		want                         LifecycleAction
+	}{
+		{
+			name:                         "Running + lifecycle.phase=stopped -> Hibernate",
+			currentStatus:                acidv1.ClusterStatusRunning,
+			newLifecyclePhase:            "stopped",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 0,
+			want:                         LifecycleActionHibernate,
+		},
+		{
+			name:                         "Running + no lifecycle -> None",
+			currentStatus:                acidv1.ClusterStatusRunning,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 0,
+			want:                         LifecycleActionNone,
+		},
+		{
+			name:                         "Stopping + lifecycle.phase=stopped -> None (already stopping)",
+			currentStatus:                acidv1.ClusterStatusStopping,
+			newLifecyclePhase:            "stopped",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionNone,
+		},
+		{
+			name:                         "Stopped + lifecycle.phase=stopped -> None (still hibernated)",
+			currentStatus:                acidv1.ClusterStatusStopped,
+			newLifecyclePhase:            "stopped",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionNone,
+		},
+		{
+			name:                         "Stopped + lifecycle cleared + has previous instances + numInst=0 -> WakeUp",
+			currentStatus:                acidv1.ClusterStatusStopped,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionWakeUp,
+		},
+		{
+			name:                         "Running + lifecycle cleared + previous instances + numInst=0 -> WakeUp",
+			currentStatus:                acidv1.ClusterStatusRunning,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionWakeUp,
+		},
+		{
+			name:                         "Running + lifecycle cleared + previous instances + numInst>0 -> None",
+			currentStatus:                acidv1.ClusterStatusRunning,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionNone,
+		},
+		{
+			name:                         "Running + lifecycle cleared + no previous instances -> None",
+			currentStatus:                acidv1.ClusterStatusRunning,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 0,
+			want:                         LifecycleActionNone,
+		},
+		{
+			name:                         "Stopped + lifecycle cleared + no previous instances -> WakeUp (operator restart catch-up)",
+			currentStatus:                acidv1.ClusterStatusStopped,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 0,
+			want:                         LifecycleActionWakeUp,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var lifecycle *acidv1.LifecycleSpec
+			if tt.newLifecyclePhase != "" {
+				lifecycle = &acidv1.LifecycleSpec{Phase: tt.newLifecyclePhase}
+			}
+
+			status := acidv1.PostgresStatus{PostgresClusterStatus: tt.currentStatus}
+
+			got := detectLifecycleTransition(
+				&status,
+				lifecycle,
+				tt.newNumberOfInstances,
+				tt.newPreviousNumberOfInstances,
+			)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }
 
-func updatePostgresqlStatusInClient(client *k8sutil.KubernetesClient, pg *acidv1.Postgresql) (*acidv1.Postgresql, error) {
-	return client.Postgresqls(pg.Namespace).UpdateStatus(context.TODO(), pg, metav1.UpdateOptions{})
+func TestInitiateHibernate(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusRunning, 3, "", 0, nil)
+
+	newSpec := &acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+		Spec: acidv1.PostgresSpec{
+			NumberOfInstances: 3,
+		},
+		Status: acidv1.PostgresStatus{
+			PostgresClusterStatus: acidv1.ClusterStatusRunning,
+		},
+	}
+
+	c.initiateHibernate(newSpec)
+
+	assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances, "numberOfInstances should be set to 0")
+	assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances, "previousNumberOfInstances should be stored")
+	assert.Equal(t, acidv1.ClusterStatusStopping, newSpec.Status.PostgresClusterStatus, "status should be Stopping")
+}
+
+func TestInitiateWakeUp(t *testing.T) {
+	t.Run("restores numberOfInstances and clears Previous fields", func(t *testing.T) {
+		client, _, _ := newFakeK8sClientForLifecycle()
+		c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "", 0, nil)
+
+		newSpec := &acidv1.Postgresql{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+			Spec: acidv1.PostgresSpec{
+				NumberOfInstances: 0,
+			},
+			Status: acidv1.PostgresStatus{
+				PostgresClusterStatus:      acidv1.ClusterStatusStopped,
+				PreviousNumberOfInstances:  3,
+				PreviousPoolerInstances:    map[string]int32{"master": 2, "replica": 0},
+			},
+		}
+
+		c.initiateWakeUp(newSpec)
+
+		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances, "numberOfInstances should be restored")
+		assert.Equal(t, acidv1.ClusterStatusUpdating, newSpec.Status.PostgresClusterStatus, "status should be Updating")
+		assert.Equal(t, int32(0), newSpec.Status.PreviousNumberOfInstances, "previousNumberOfInstances should be cleared")
+		assert.Nil(t, newSpec.Status.PreviousPoolerInstances, "previousPoolerInstances should be cleared")
+	})
+
+	t.Run("previousNumberOfInstances=0 still transitions to Updating", func(t *testing.T) {
+		client, _, _ := newFakeK8sClientForLifecycle()
+		c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "", 0, nil)
+
+		newSpec := &acidv1.Postgresql{
+			ObjectMeta: metav1.ObjectMeta{Name: "test-cluster", Namespace: "default"},
+			Spec: acidv1.PostgresSpec{
+				NumberOfInstances: 0,
+			},
+			Status: acidv1.PostgresStatus{
+				PostgresClusterStatus:     acidv1.ClusterStatusStopped,
+				PreviousPoolerInstances:   map[string]int32{"master": 1},
+			},
+		}
+
+		c.initiateWakeUp(newSpec)
+
+		assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances, "numberOfInstances stays 0 when previous is 0")
+		assert.Equal(t, acidv1.ClusterStatusUpdating, newSpec.Status.PostgresClusterStatus, "status should still be Updating")
+		assert.Equal(t, int32(0), newSpec.Status.PreviousNumberOfInstances, "previousNumberOfInstances stays 0")
+		assert.Nil(t, newSpec.Status.PreviousPoolerInstances, "previousPoolerInstances should be cleared")
+	})
+}
+
+func TestPrepareLifecycleTransition_Hibernate(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusRunning, 3, "", 0, nil)
+
+	newSpec := c.Postgresql.DeepCopy()
+	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: "stopped"}
+
+	oldSpec := acidv1.Postgresql{
+		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning},
+	}
+
+	proceed, err := c.prepareLifecycleTransition(&newSpec, oldSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, proceed, "hibernate should proceed with sync")
+	assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances, "numberOfInstances should be set to 0")
+	assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances, "previousNumberOfInstances should be stored")
+	assert.Equal(t, acidv1.ClusterStatusStopping, newSpec.Status.PostgresClusterStatus, "status should be Stopping")
+
+	persisted, err := client.Postgresqls("default").Get(context.TODO(), "test-cluster", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, acidv1.ClusterStatusStopping, persisted.Status.PostgresClusterStatus, "persisted status should be Stopping")
+	assert.Equal(t, int32(3), persisted.Status.PreviousNumberOfInstances, "persisted previousNumberOfInstances should be 3")
+	assert.Equal(t, int32(0), persisted.Spec.NumberOfInstances, "persisted numberOfInstances should be 0")
+}
+
+func TestPrepareLifecycleTransition_WakeUp(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(
+		client,
+		acidv1.ClusterStatusStopped,
+		0,
+		"",
+		3,
+		map[string]int32{"master": 2, "replica": 0},
+	)
+
+	newSpec := c.Postgresql.DeepCopy()
+
+	oldSpec := acidv1.Postgresql{
+		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusStopped},
+	}
+
+	proceed, err := c.prepareLifecycleTransition(&newSpec, oldSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, proceed, "wake-up should proceed with sync")
+	assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances, "numberOfInstances should be restored")
+	assert.Equal(t, acidv1.ClusterStatusUpdating, newSpec.Status.PostgresClusterStatus, "status should be Updating")
+	assert.Equal(t, int32(0), newSpec.Status.PreviousNumberOfInstances, "previousNumberOfInstances should be cleared after persistence")
+	assert.Nil(t, newSpec.Status.PreviousPoolerInstances, "previousPoolerInstances should be cleared after persistence")
+
+	persisted, err := client.Postgresqls("default").Get(context.TODO(), "test-cluster", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, acidv1.ClusterStatusUpdating, persisted.Status.PostgresClusterStatus, "persisted status should be Updating")
+	assert.Equal(t, int32(3), persisted.Spec.NumberOfInstances, "persisted numberOfInstances should be 3")
+	assert.Equal(t, int32(0), persisted.Status.PreviousNumberOfInstances, "persisted previousNumberOfInstances should be 0")
+	assert.Nil(t, persisted.Status.PreviousPoolerInstances, "persisted previousPoolerInstances should be nil")
+}
+
+func TestPrepareLifecycleTransition_StoppedNoTransition(t *testing.T) {
+	client, _, acidClientSet := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(
+		client,
+		acidv1.ClusterStatusStopped,
+		0,
+		"stopped",
+		3,
+		nil,
+	)
+
+	updateCalled := false
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateCalled = true
+		return false, nil, nil
+	})
+
+	newSpec := c.Postgresql.DeepCopy()
+
+	oldSpec := acidv1.Postgresql{
+		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusStopped},
+	}
+
+	proceed, err := c.prepareLifecycleTransition(&newSpec, oldSpec)
+
+	assert.NoError(t, err)
+	assert.False(t, proceed, "stopped cluster with lifecycle=stopped should skip sync")
+	assert.False(t, updateCalled, "no K8s API writes should happen for stopped-no-transition")
+	assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances, "numberOfInstances should be unchanged")
+	assert.Equal(t, acidv1.ClusterStatusStopped, newSpec.Status.PostgresClusterStatus, "status should remain Stopped")
+}
+
+func TestPrepareLifecycleTransition_NoTransitionRunning(t *testing.T) {
+	client, _, acidClientSet := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusRunning, 3, "", 0, nil)
+
+	updateCalled := false
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		updateCalled = true
+		return false, nil, nil
+	})
+
+	newSpec := c.Postgresql.DeepCopy()
+
+	oldSpec := acidv1.Postgresql{
+		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning},
+	}
+
+	proceed, err := c.prepareLifecycleTransition(&newSpec, oldSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, proceed, "no-transition running cluster should proceed with sync")
+	assert.False(t, updateCalled, "no K8s API writes should happen for no-transition")
+	assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances, "numberOfInstances should be unchanged")
+	assert.Equal(t, acidv1.ClusterStatusRunning, newSpec.Status.PostgresClusterStatus, "status should remain Running")
+}
+
+func TestPrepareLifecycleTransition_UpdateSpecFails(t *testing.T) {
+	client, _, acidClientSet := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusRunning, 3, "", 0, nil)
+
+	acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf("api server unavailable")
+	})
+
+	newSpec := c.Postgresql.DeepCopy()
+	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: "stopped"}
+
+	oldSpec := acidv1.Postgresql{
+		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning},
+	}
+
+	proceed, err := c.prepareLifecycleTransition(&newSpec, oldSpec)
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "could not update spec for lifecycle action")
+	assert.False(t, proceed, "should not proceed when spec write fails")
+}
+
+func TestPersistStoppingCompletedTransition(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, "stopped", 3, nil)
+
+	newSpec := c.Postgresql.DeepCopy()
+	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
+
+	handled, err := c.persistStoppingCompletedTransition(newSpec)
+
+	assert.NoError(t, err)
+	assert.True(t, handled, "should report handled=true on success")
+
+	persisted, err := client.Postgresqls("default").Get(context.TODO(), "test-cluster", metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, acidv1.ClusterStatusStopped, persisted.Status.PostgresClusterStatus, "persisted status should be Stopped")
+	assert.Equal(t, acidv1.ClusterStatusStopped, c.Postgresql.Status.PostgresClusterStatus, "cache should reflect Stopped")
 }
 
 func TestGetPoolerReplicas(t *testing.T) {
@@ -203,33 +527,29 @@ func TestPatchPoolerReplicas(t *testing.T) {
 		errContains string
 	}{
 		{
-			name:       "deployment exists, patch succeeds",
-			replicas:    0,
+			name:     "deployment exists, patch succeeds",
+			replicas: 0,
 			setupClient: func(clientSet *fake.Clientset) {
-				// Pre-create the deployment in the fake clientset
-				clientSet.AppsV1().Deployments("default").Create(context.TODO(), &appsv1.Deployment{
+				_, _ = clientSet.AppsV1().Deployments("default").Create(context.TODO(), &appsv1.Deployment{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-pooler"},
-					Spec:      appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+					Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
 				}, metav1.CreateOptions{})
 			},
 			wantErr: false,
 		},
 		{
-			name:       "deployment not found",
+			name:        "deployment not found - returns nil",
 			replicas:    2,
-			setupClient: func(clientSet *fake.Clientset) {
-				// Don't create anything - will trigger NotFound
-			},
-			wantErr: false, // NotFound is handled gracefully
+			setupClient: func(clientSet *fake.Clientset) {},
+			wantErr:     false,
 		},
 		{
-			name:       "patch returns error",
-			replicas:    2,
+			name:     "patch returns error",
+			replicas: 2,
 			setupClient: func(clientSet *fake.Clientset) {
-				// Pre-create deployment but make patch fail via reactor
-				clientSet.AppsV1().Deployments("default").Create(context.TODO(), &appsv1.Deployment{
+				_, _ = clientSet.AppsV1().Deployments("default").Create(context.TODO(), &appsv1.Deployment{
 					ObjectMeta: metav1.ObjectMeta{Name: "test-cluster-pooler"},
-					Spec:      appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
+					Spec:       appsv1.DeploymentSpec{Replicas: int32Ptr(2)},
 				}, metav1.CreateOptions{})
 				clientSet.PrependReactor("patch", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
 					return true, nil, fmt.Errorf("network error")
@@ -274,486 +594,6 @@ func TestPatchPoolerReplicas(t *testing.T) {
 	}
 }
 
-func TestBlockLifecycleUpdate(t *testing.T) {
-	tests := []struct {
-		name           string
-		currentStatus  string
-		lifecyclePhase string
-		wantBlocked    bool
-		wantErr        bool
-		errContains    string
-	}{
-		{
-			name:          "Running cluster, allows update",
-			currentStatus: "Running",
-			wantBlocked:   false,
-			wantErr:       false,
-		},
-		{
-			name:          "Stopping state, blocks update",
-			currentStatus: "Stopping",
-			wantBlocked:   true,
-			wantErr:       true,
-			errContains:   "cannot update cluster while it is stopping",
-		},
-		{
-			name:           "Stopped with lifecycle phase, blocks update",
-			currentStatus:  "Stopped",
-			lifecyclePhase: "stopped",
-			wantBlocked:    true,
-			wantErr:        true,
-			errContains:   "cannot update cluster while stopped",
-		},
-		{
-			name:           "Stopped without lifecycle phase, allows update (wake-up)",
-			currentStatus:  "Stopped",
-			lifecyclePhase: "",
-			wantBlocked:    false,
-			wantErr:        false,
-		},
-		{
-			name:           "Stopped with nil lifecycle, allows update (wake-up)",
-			currentStatus:  "Stopped",
-			lifecyclePhase: "",
-			wantBlocked:    false,
-			wantErr:        false,
-		},
-		{
-			name:           "Stopped with empty lifecycle phase, allows update (wake-up)",
-			currentStatus:  "Stopped",
-			lifecyclePhase: "",
-			wantBlocked:    false,
-			wantErr:        false,
-		},
-		{
-			name:          "UpdateFailed state, allows update",
-			currentStatus: "UpdateFailed",
-			wantBlocked:   false,
-			wantErr:       false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			c := newTestLifecycleCluster(tt.currentStatus, 3, tt.lifecyclePhase)
-
-			newSpec := c.DeepCopy()
-			if tt.lifecyclePhase != "" && tt.currentStatus != "Stopped" {
-				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: tt.lifecyclePhase}
-			}
-
-			blocked, err := c.blockLifecycleUpdate(newSpec)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				if tt.errContains != "" {
-					assert.Contains(t, err.Error(), tt.errContains)
-				}
-			} else {
-				assert.NoError(t, err)
-			}
-			assert.Equal(t, tt.wantBlocked, blocked)
-		})
-	}
-}
-
-func TestManageHibernateState(t *testing.T) {
-	tests := []struct {
-		name                   string
-		oldSpecStatus          string
-		newSpecStatus          string
-		newSpecLifecyclePhase  string
-		numberOfInstances      int32
-		previousNumberOfInst   int32
-		statefulsetReplicas    *int32
-		wantContinue           bool
-		wantNumberOfInstances  *int32
-		wantStatus             string
-	}{
-		{
-			name:                  "Running to Stopping - initiates hibernate",
-			oldSpecStatus:         "Running",
-			newSpecStatus:         "Running",
-			newSpecLifecyclePhase: "stopped",
-			numberOfInstances:     3,
-			statefulsetReplicas:   int32Ptr(3),
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(0),
-			wantStatus:            "Stopping",
-		},
-		{
-			name:                 "Stopping to Stopped - when replicas reach 0",
-			oldSpecStatus:        "Stopping",
-			newSpecStatus:        "Stopping",
-			numberOfInstances:     0,
-			statefulsetReplicas:  int32Ptr(0),
-			wantContinue:         true,
-			wantNumberOfInstances: int32Ptr(0),
-			wantStatus:           "Stopped",
-		},
-		{
-			name:                 "Stopping - replicas not yet 0",
-			oldSpecStatus:        "Stopping",
-			newSpecStatus:        "Stopping",
-			numberOfInstances:     0,
-			statefulsetReplicas:  int32Ptr(2), // Still terminating
-			wantContinue:         true,
-			wantNumberOfInstances: nil, // Should NOT change
-			wantStatus:           "Stopping", // Should NOT change
-		},
-		{
-			name:                  "Stopped to wake-up - restores numberOfInstances",
-			oldSpecStatus:         "Stopped",
-			newSpecStatus:         "Stopped",
-			newSpecLifecyclePhase: "", // Cleared
-			numberOfInstances:      0,
-			previousNumberOfInst:   3,
-			statefulsetReplicas:   int32Ptr(0),
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(3),
-			wantStatus:            "Updating",
-		},
-		{
-			name:                 "Stopped but lifecycle still 'stopped' - skip sync",
-			oldSpecStatus:        "Stopped",
-			newSpecStatus:        "Stopped",
-			newSpecLifecyclePhase: "stopped",
-			numberOfInstances:     0,
-			statefulsetReplicas:  int32Ptr(0),
-			wantContinue:         false, // Should skip sync
-			wantNumberOfInstances: nil,
-			wantStatus:           "Stopped",
-		},
-		{
-			name:                  "Running without lifecycle - continue normal",
-			oldSpecStatus:         "Running",
-			newSpecStatus:         "Running",
-			newSpecLifecyclePhase: "",
-			numberOfInstances:     3,
-			statefulsetReplicas:  int32Ptr(3),
-			wantContinue:         true,
-			wantNumberOfInstances: int32Ptr(3), // Unchanged
-			wantStatus:           "Running",      // Unchanged
-		},
-		{
-			name:                  "Running to Updating - normal update",
-			oldSpecStatus:         "Running",
-			newSpecStatus:         "Updating",
-			newSpecLifecyclePhase: "",
-			numberOfInstances:     3,
-			statefulsetReplicas:  int32Ptr(3),
-			wantContinue:         true,
-			wantNumberOfInstances: int32Ptr(3),
-			wantStatus:           "Updating",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
-
-			if tt.statefulsetReplicas != nil {
-				_, err := clientSet.AppsV1().StatefulSets("default").Create(
-					context.TODO(),
-					&appsv1.StatefulSet{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "test-cluster",
-							Namespace: "default",
-						},
-						Spec: appsv1.StatefulSetSpec{
-							Replicas: tt.statefulsetReplicas,
-						},
-					},
-					metav1.CreateOptions{},
-				)
-				assert.NoError(t, err)
-			}
-
-			c := &Cluster{
-				logger: lifecycleLogger,
-				Postgresql: acidv1.Postgresql{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-cluster",
-						Namespace: "default",
-					},
-				},
-				KubeClient: *kubeClient,
-			}
-
-			oldSpec := acidv1.Postgresql{
-				Status: acidv1.PostgresStatus{
-					PostgresClusterStatus: tt.oldSpecStatus,
-				},
-			}
-
-			newSpec := &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					NumberOfInstances: tt.numberOfInstances,
-				},
-				Status: acidv1.PostgresStatus{
-					PostgresClusterStatus:      tt.newSpecStatus,
-					PreviousNumberOfInstances: tt.previousNumberOfInst,
-				},
-			}
-
-			if tt.newSpecLifecyclePhase != "" {
-				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{
-					Phase: tt.newSpecLifecyclePhase,
-				}
-			}
-
-			_, gotContinue := c.manageHibernateState(oldSpec, newSpec)
-
-			assert.Equal(t, tt.wantContinue, gotContinue)
-
-			if tt.wantNumberOfInstances != nil {
-				assert.Equal(t, *tt.wantNumberOfInstances, newSpec.Spec.NumberOfInstances)
-			}
-			assert.Equal(t, tt.wantStatus, newSpec.Status.PostgresClusterStatus)
-		})
-	}
-}
-
-func TestHandleHibernateAndWakeUp_Hibernate(t *testing.T) {
-	tests := []struct {
-		name                string
-		currentStatus       string
-		numberOfInstances   int32
-		lifecyclePhase      string
-		poolerObjs         map[PostgresRole]*ConnectionPoolerObjects
-		k8sUpdateSucceeds   bool
-		k8sStatusSucceeds   bool
-		poolerPatchSucceeds bool
-		wantHandled         bool
-		wantErr             bool
-		errContains         string
-	}{
-		{
-			name:               "Running + lifecycle.phase=stopped - initiates hibernate",
-			currentStatus:      "Running",
-			numberOfInstances:  3,
-			lifecyclePhase:     "stopped",
-			k8sUpdateSucceeds: true,
-			k8sStatusSucceeds:  true,
-			poolerPatchSucceeds: true,
-			wantHandled: true,
-			wantErr:    false,
-		},
-		{
-			name:               "Running + lifecycle.phase=stopped - K8s update fails",
-			currentStatus:      "Running",
-			numberOfInstances:  3,
-			lifecyclePhase:     "stopped",
-			k8sUpdateSucceeds: false,
-			wantHandled: false,
-			wantErr:     true,
-			errContains: "could not update spec during hibernate",
-		},
-		{
-			name:               "Running + lifecycle.phase=stopped - K8s status update fails",
-			currentStatus:      "Running",
-			numberOfInstances:  3,
-			lifecyclePhase:     "stopped",
-			k8sUpdateSucceeds: true,
-			k8sStatusSucceeds: false,
-			wantHandled: false,
-			wantErr:     true,
-			errContains: "could not update status during hibernate",
-		},
-		{
-			name:               "Running + no lifecycle phase - no transition",
-			currentStatus:      "Running",
-			numberOfInstances:  3,
-			lifecyclePhase:      "",
-			wantHandled: false,
-			wantErr:    false,
-		},
-		{
-			name:               "Stopped + lifecycle cleared - initiates wake-up",
-			currentStatus:      "Stopped",
-			numberOfInstances:  0,
-			lifecyclePhase:      "",
-			k8sUpdateSucceeds:  true,
-			k8sStatusSucceeds:  true,
-			wantHandled:         true,
-			wantErr:             false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			kubeClient, _, acidClientSet := newFakeK8sClientForLifecycle()
-
-			if tt.k8sUpdateSucceeds {
-				acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
-					updateAction := action.(k8stesting.UpdateAction)
-					pg := updateAction.GetObject().(*acidv1.Postgresql)
-					return true, pg, nil
-				})
-			}
-
-			if !tt.k8sStatusSucceeds {
-				acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
-					if action.GetSubresource() == "status" {
-						return true, nil, fmt.Errorf("status update failed")
-					}
-					return false, nil, nil
-				})
-			}
-
-			c := &Cluster{
-				Config: Config{
-					OpConfig: config.Config{
-						PodManagementPolicy: "ordered_ready",
-					},
-				},
-				Postgresql: acidv1.Postgresql{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-cluster",
-						Namespace: "default",
-					},
-					Spec: acidv1.PostgresSpec{
-						TeamID:           "test-team",
-						NumberOfInstances: tt.numberOfInstances,
-						Volume:           acidv1.Volume{Size: "1Gi"},
-					},
-					Status: acidv1.PostgresStatus{
-						PostgresClusterStatus: tt.currentStatus,
-					},
-				},
-				KubeClient:     *kubeClient,
-				ConnectionPooler: tt.poolerObjs,
-				logger:         lifecycleLogger,
-				eventRecorder:  lifecycleEventRecorder,
-			}
-
-			newSpec := c.DeepCopy()
-			if tt.lifecyclePhase != "" {
-				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: tt.lifecyclePhase}
-			}
-
-			handled, err := c.handleHibernateAndWakeUp(newSpec)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				if tt.errContains != "" {
-					assert.Contains(t, err.Error(), tt.errContains)
-				}
-			} else {
-				assert.NoError(t, err)
-			}
-			assert.Equal(t, tt.wantHandled, handled)
-		})
-	}
-}
-
-func TestHandleHibernateAndWakeUp_WakeUp(t *testing.T) {
-	tests := []struct {
-		name                    string
-		currentStatus           string
-		numberOfInstances       int32
-		previousNumberOfInst     int32
-		previousPoolerInstances  map[string]int32
-		lifecyclePhase           string
-		k8sUpdateSucceeds        bool
-		k8sStatusSucceeds        bool
-		poolerPatchSucceeds      bool
-		wantHandled             bool
-		wantErr                 bool
-		errContains             string
-	}{
-		{
-			name:                   "Stopped + lifecycle cleared - wake-up",
-			currentStatus:          "Stopped",
-			numberOfInstances:      0,
-			previousNumberOfInst:    3,
-			previousPoolerInstances: map[string]int32{"master": 2, "replica": 0},
-			lifecyclePhase:          "",
-			k8sUpdateSucceeds:      true,
-			k8sStatusSucceeds:     true,
-			wantHandled:            true,
-			wantErr:                false,
-		},
-		{
-			name:                   "Stopped + previousNumberOfInstances is 0 - still initiates wake-up",
-			currentStatus:          "Stopped",
-			numberOfInstances:      0,
-			previousNumberOfInst:    0,
-			lifecyclePhase:          "",
-			k8sUpdateSucceeds:      true,
-			k8sStatusSucceeds:      true,
-			wantHandled:            true,
-			wantErr:                false,
-		},
-		{
-			name:                   "Stopped + lifecycle cleared + K8s update fails",
-			currentStatus:          "Stopped",
-			numberOfInstances:      0,
-			previousNumberOfInst:    3,
-			lifecyclePhase:          "",
-			k8sUpdateSucceeds:      false,
-			wantHandled:            false,
-			wantErr:                true,
-			errContains:            "could not update spec during wake-up",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			kubeClient, _, acidClientSet := newFakeK8sClientForLifecycle()
-
-			if tt.k8sUpdateSucceeds {
-				acidClientSet.PrependReactor("update", "postgresqls", func(action k8stesting.Action) (bool, runtime.Object, error) {
-					updateAction := action.(k8stesting.UpdateAction)
-					pg := updateAction.GetObject().(*acidv1.Postgresql)
-					return true, pg, nil
-				})
-			}
-
-			c := &Cluster{
-				Config: Config{
-					OpConfig: config.Config{
-						PodManagementPolicy: "ordered_ready",
-					},
-				},
-				Postgresql: acidv1.Postgresql{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-cluster",
-						Namespace: "default",
-					},
-					Spec: acidv1.PostgresSpec{
-						TeamID:           "test-team",
-						NumberOfInstances: tt.numberOfInstances,
-						Volume:           acidv1.Volume{Size: "1Gi"},
-					},
-					Status: acidv1.PostgresStatus{
-						PostgresClusterStatus:      tt.currentStatus,
-						PreviousNumberOfInstances:  tt.previousNumberOfInst,
-						PreviousPoolerInstances:     tt.previousPoolerInstances,
-					},
-				},
-				KubeClient:    *kubeClient,
-				logger:        lifecycleLogger,
-				eventRecorder: lifecycleEventRecorder,
-			}
-
-			newSpec := c.DeepCopy()
-
-			handled, err := c.handleHibernateAndWakeUp(newSpec)
-
-			if tt.wantErr {
-				assert.Error(t, err)
-				if tt.errContains != "" {
-					assert.Contains(t, err.Error(), tt.errContains)
-				}
-			} else {
-				assert.NoError(t, err)
-			}
-			assert.Equal(t, tt.wantHandled, handled)
-		})
-	}
-}
-
 func TestScalePoolerDown(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -793,9 +633,9 @@ func TestScalePoolerDown(t *testing.T) {
 			}
 
 			c := &Cluster{
-				KubeClient:      *kubeClient,
+				KubeClient:       *kubeClient,
 				ConnectionPooler: tt.poolerObjs,
-				logger:          lifecycleLogger,
+				logger:           lifecycleLogger,
 				Postgresql: acidv1.Postgresql{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      "test-cluster",
@@ -822,18 +662,17 @@ func TestScalePoolerUp(t *testing.T) {
 		{
 			name:     "nil PreviousPoolerInstances - no-op",
 			prevInst: nil,
+			wantErr:  false,
 		},
 		{
 			name:     "Restore master to 2",
 			prevInst: map[string]int32{"master": 2},
+			wantErr:  false,
 		},
 		{
 			name:     "Restore both roles",
 			prevInst: map[string]int32{"master": 2, "replica": 1},
-		},
-		{
-			name:     "Restore master to 0 (keep at 0)",
-			prevInst: map[string]int32{"master": 0},
+			wantErr:  false,
 		},
 	}
 
@@ -862,435 +701,13 @@ func TestScalePoolerUp(t *testing.T) {
 			}
 			err := c.scalePoolerUp(newSpec)
 
-			assert.NoError(t, err)
-		})
-	}
-}
-
-func TestLifecycleStateTransitions(t *testing.T) {
-	t.Run("complete Hibernate flow: Running -> Stopping -> Stopped", func(t *testing.T) {
-		c := &Cluster{
-			logger: lifecycleLogger,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			},
-		}
-
-		// Initial: Running
-		oldSpec := acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Running"},
-		}
-		newSpec := &acidv1.Postgresql{
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 3,
-				Lifecycle:         &acidv1.LifecycleSpec{Phase: "stopped"},
-			},
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Running"},
-		}
-
-		// Step 1: manageHibernateState should initiate hibernate
-		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances)
-		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
-		assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances)
-	})
-
-	t.Run("complete Wake-up flow: Stopped -> Updating -> Running", func(t *testing.T) {
-		c := &Cluster{
-			logger: lifecycleLogger,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			},
-		}
-
-		// After hibernate: Stopped, replicas = 0
-		c.Statefulset = &appsv1.StatefulSet{
-			Spec: appsv1.StatefulSetSpec{Replicas: int32Ptr(0)},
-		}
-
-		oldSpec := acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Stopped"},
-		}
-		newSpec := &acidv1.Postgresql{
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 0,
-				// Lifecycle cleared by user
-			},
-			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus:      "Stopped",
-				PreviousNumberOfInstances: 3,
-			},
-		}
-
-		// Step 1: manageHibernateState should restore
-		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
-		assert.Equal(t, "Updating", newSpec.Status.PostgresClusterStatus)
-	})
-}
-
-func TestLifecycleUpdateBlocksDuringStopping(t *testing.T) {
-	kubeClient, _, _ := newFakeK8sClientForLifecycle()
-
-	c := &Cluster{
-		Config: Config{
-			OpConfig: config.Config{},
-		},
-		Postgresql: acidv1.Postgresql{
-			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 0,
-				Lifecycle:         &acidv1.LifecycleSpec{Phase: "stopped"},
-			},
-			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus: "Stopping",
-			},
-		},
-		KubeClient: *kubeClient,
-		logger:     lifecycleLogger,
-	}
-
-	newSpec := c.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
-
-	assert.True(t, blocked)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot update cluster while it is stopping")
-}
-
-func TestLifecycleUpdateBlocksWhenStoppedWithPhase(t *testing.T) {
-	kubeClient, _, _ := newFakeK8sClientForLifecycle()
-
-	c := &Cluster{
-		Config: Config{
-			OpConfig: config.Config{},
-		},
-		Postgresql: acidv1.Postgresql{
-			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 0,
-				Lifecycle:         &acidv1.LifecycleSpec{Phase: "stopped"},
-			},
-			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus: "Stopped",
-			},
-		},
-		KubeClient: *kubeClient,
-		logger:     lifecycleLogger,
-	}
-
-	newSpec := c.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
-
-	assert.True(t, blocked)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "cannot update cluster while stopped")
-}
-
-func TestLifecycleUpdateAllowsWakeUp(t *testing.T) {
-	kubeClient, _, _ := newFakeK8sClientForLifecycle()
-
-	c := &Cluster{
-		Config: Config{
-			OpConfig: config.Config{},
-		},
-		Postgresql: acidv1.Postgresql{
-			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 0,
-				// Lifecycle cleared by user
-			},
-			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus:      "Stopped",
-				PreviousNumberOfInstances: 3,
-			},
-		},
-		KubeClient: *kubeClient,
-		logger:     lifecycleLogger,
-	}
-
-	newSpec := c.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
-
-	assert.False(t, blocked)
-	assert.NoError(t, err)
-}
-
-func TestManageHibernateState_EdgeCases(t *testing.T) {
-	tests := []struct {
-		name                  string
-		statefulsetReplicas   *int32
-		currentStatus         string
-		newSpecLifecyclePhase string
-		newSpecNumberOfInst   int32
-		previousNumberOfInst  int32
-		wantContinue          bool
-		wantNumberOfInstances *int32
-		wantStatus            string
-	}{
-		{
-			name:                "Stopping state with nil statefulset - should not transition to Stopped",
-			statefulsetReplicas: nil,
-			currentStatus:       "Stopping",
-			newSpecLifecyclePhase: "stopped",
-			newSpecNumberOfInst:  0,
-			wantContinue:         true,
-			wantNumberOfInstances: nil,
-			wantStatus:          "Stopping",
-		},
-		{
-			name:                "Stopping with nil Lifecycle spec",
-			statefulsetReplicas: int32Ptr(0),
-			currentStatus:       "Stopping",
-			newSpecLifecyclePhase: "",
-			newSpecNumberOfInst:  0,
-			wantContinue:         true,
-			wantNumberOfInstances: nil,
-			wantStatus:          "Stopped",
-		},
-		{
-			name:                 "Running to Stopping when numberOfInstances already 0",
-			statefulsetReplicas:  int32Ptr(0),
-			currentStatus:        "Running",
-			newSpecLifecyclePhase: "stopped",
-			newSpecNumberOfInst:   0,
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(0),
-			wantStatus:           "Stopping",
-		},
-		{
-			name:                 "Stopped with previousNumberOfInstances=0 - sets Updating but warns",
-			statefulsetReplicas:  int32Ptr(0),
-			currentStatus:        "Stopped",
-			newSpecLifecyclePhase: "",
-			newSpecNumberOfInst:   0,
-			previousNumberOfInst:  0,
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(0),
-			wantStatus:           "Updating",
-		},
-		{
-			name:                 "Stopped with nil Lifecycle - wake-up",
-			statefulsetReplicas:  int32Ptr(0),
-			currentStatus:        "Stopped",
-			newSpecLifecyclePhase: "",
-			newSpecNumberOfInst:   0,
-			previousNumberOfInst:  3,
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(3),
-			wantStatus:           "Updating",
-		},
-		{
-			name:                 "Stopped with empty Lifecycle phase - wake-up",
-			statefulsetReplicas:  int32Ptr(0),
-			currentStatus:        "Stopped",
-			newSpecLifecyclePhase: "",
-			newSpecNumberOfInst:   0,
-			previousNumberOfInst:  2,
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(2),
-			wantStatus:           "Updating",
-		},
-		{
-			name:                 "Stopped but lifecycle still 'stopped' - skip sync",
-			statefulsetReplicas:  int32Ptr(0),
-			currentStatus:        "Stopped",
-			newSpecLifecyclePhase: "stopped",
-			newSpecNumberOfInst:   0,
-			previousNumberOfInst:  3,
-			wantContinue:          false,
-			wantNumberOfInstances: nil,
-			wantStatus:           "Stopped",
-		},
-		{
-			name:                 "Running without lifecycle change - normal update",
-			statefulsetReplicas:  int32Ptr(3),
-			currentStatus:        "Running",
-			newSpecLifecyclePhase: "",
-			newSpecNumberOfInst:   3,
-			previousNumberOfInst:  0,
-			wantContinue:          true,
-			wantNumberOfInstances: int32Ptr(3),
-			wantStatus:           "Running",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
-
-			if tt.statefulsetReplicas != nil {
-				_, err := clientSet.AppsV1().StatefulSets("default").Create(
-					context.TODO(),
-					&appsv1.StatefulSet{
-						ObjectMeta: metav1.ObjectMeta{
-							Name:      "test-cluster",
-							Namespace: "default",
-						},
-						Spec: appsv1.StatefulSetSpec{
-							Replicas: tt.statefulsetReplicas,
-						},
-					},
-					metav1.CreateOptions{},
-				)
+			if tt.wantErr {
+				assert.Error(t, err)
+			} else {
 				assert.NoError(t, err)
 			}
-
-			c := &Cluster{
-				logger:     lifecycleLogger,
-				KubeClient: *kubeClient,
-				Postgresql: acidv1.Postgresql{
-					ObjectMeta: metav1.ObjectMeta{
-						Name:      "test-cluster",
-						Namespace: "default",
-					},
-				},
-			}
-
-			if tt.statefulsetReplicas != nil {
-				c.Statefulset = &appsv1.StatefulSet{
-					Spec: appsv1.StatefulSetSpec{
-						Replicas: tt.statefulsetReplicas,
-					},
-				}
-			}
-
-			oldSpec := acidv1.Postgresql{
-				Status: acidv1.PostgresStatus{
-					PostgresClusterStatus: tt.currentStatus,
-				},
-			}
-
-			newSpec := &acidv1.Postgresql{
-				Spec: acidv1.PostgresSpec{
-					NumberOfInstances: tt.newSpecNumberOfInst,
-				},
-				Status: acidv1.PostgresStatus{
-					PostgresClusterStatus:      tt.currentStatus,
-					PreviousNumberOfInstances: tt.previousNumberOfInst,
-				},
-			}
-
-			if tt.newSpecLifecyclePhase != "" || tt.newSpecLifecyclePhase == "" && tt.currentStatus == "Stopped" {
-				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{
-					Phase: tt.newSpecLifecyclePhase,
-				}
-			}
-
-			_, gotContinue := c.manageHibernateState(oldSpec, newSpec)
-
-			assert.Equal(t, tt.wantContinue, gotContinue, "continue sync mismatch")
-			if tt.wantNumberOfInstances != nil {
-				assert.Equal(t, *tt.wantNumberOfInstances, newSpec.Spec.NumberOfInstances, "numberOfInstances mismatch")
-			}
-			assert.Equal(t, tt.wantStatus, newSpec.Status.PostgresClusterStatus, "status mismatch")
 		})
 	}
-}
-
-func TestManageHibernateState_StateTransitionSequence(t *testing.T) {
-	t.Run("Running -> Stopping -> Stopped sequence", func(t *testing.T) {
-		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(
-			context.TODO(),
-			&appsv1.StatefulSet{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-				Spec:       appsv1.StatefulSetSpec{Replicas: int32Ptr(3)},
-			},
-			metav1.CreateOptions{},
-		)
-		assert.NoError(t, err)
-
-		c := &Cluster{
-			logger:     lifecycleLogger,
-			KubeClient: *kubeClient,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			},
-		}
-
-		oldSpec := acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Running"},
-		}
-		newSpec := &acidv1.Postgresql{
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 3,
-				Lifecycle:         &acidv1.LifecycleSpec{Phase: "stopped"},
-			},
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Running"},
-		}
-
-		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, int32(0), newSpec.Spec.NumberOfInstances)
-		assert.Equal(t, int32(3), newSpec.Status.PreviousNumberOfInstances)
-		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
-
-		// Simulate STS still terminating (replicas=2)
-		sset, err := clientSet.AppsV1().StatefulSets("default").Get(context.TODO(), "test", metav1.GetOptions{})
-		assert.NoError(t, err)
-		sset.Spec.Replicas = int32Ptr(2)
-		_, err = clientSet.AppsV1().StatefulSets("default").Update(context.TODO(), sset, metav1.UpdateOptions{})
-		assert.NoError(t, err)
-
-		oldSpec = acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Stopping"},
-		}
-		newSpec.Status.PostgresClusterStatus = "Stopping"
-
-		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, "Stopping", newSpec.Status.PostgresClusterStatus)
-
-		// Simulate STS scaled to 0
-		sset, err = clientSet.AppsV1().StatefulSets("default").Get(context.TODO(), "test", metav1.GetOptions{})
-		assert.NoError(t, err)
-		sset.Spec.Replicas = int32Ptr(0)
-		_, err = clientSet.AppsV1().StatefulSets("default").Update(context.TODO(), sset, metav1.UpdateOptions{})
-		assert.NoError(t, err)
-
-		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, "Stopped", newSpec.Status.PostgresClusterStatus)
-	})
-
-	t.Run("Stopped -> Updating -> Running sequence", func(t *testing.T) {
-		c := &Cluster{
-			logger: lifecycleLogger,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "default"},
-			},
-		}
-
-		oldSpec := acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Stopped"},
-		}
-		newSpec := &acidv1.Postgresql{
-			Spec: acidv1.PostgresSpec{
-				NumberOfInstances: 0,
-			},
-			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus:      "Stopped",
-				PreviousNumberOfInstances: 3,
-			},
-		}
-
-		_, continueSync := c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
-		assert.Equal(t, "Updating", newSpec.Status.PostgresClusterStatus)
-
-		oldSpec = acidv1.Postgresql{
-			Status: acidv1.PostgresStatus{PostgresClusterStatus: "Updating"},
-		}
-		newSpec.Status.PostgresClusterStatus = "Updating"
-
-		_, continueSync = c.manageHibernateState(oldSpec, newSpec)
-		assert.True(t, continueSync)
-		assert.Equal(t, int32(3), newSpec.Spec.NumberOfInstances)
-	})
 }
 
 func TestSuspendLogicalBackupJob(t *testing.T) {
@@ -1324,7 +741,7 @@ func TestSuspendLogicalBackupJob(t *testing.T) {
 			jobName := "logical-backup-test-cluster"
 
 			if tt.jobExists {
-				clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
+				_, _ = clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      jobName,
 						Namespace: "default",
@@ -1419,7 +836,7 @@ func TestUnsuspendLogicalBackupJob(t *testing.T) {
 
 			if tt.jobExists {
 				suspendTrue := true
-				clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
+				_, _ = clientSet.BatchV1().CronJobs("default").Create(context.TODO(), &batchv1.CronJob{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      jobName,
 						Namespace: "default",
@@ -1483,150 +900,109 @@ func TestUnsuspendLogicalBackupJob(t *testing.T) {
 	}
 }
 
-func TestRefreshStatefulset(t *testing.T) {
-	const stsName = "test-cluster"
-
-	makeSTS := func(replicas *int32) *appsv1.StatefulSet {
-		return &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
-			Spec:       appsv1.StatefulSetSpec{Replicas: replicas},
-		}
+// blockLifecycleUpdate lives in cluster.go but is exercised here because the
+// lifecycle subsystem owns its semantics (Stopped/Stopping states).
+func TestBlockLifecycleUpdate(t *testing.T) {
+	tests := []struct {
+		name           string
+		currentStatus  string
+		lifecyclePhase string
+		wantBlocked    bool
+		wantErr        bool
+		errContains    string
+	}{
+		{
+			name:          "Running cluster, allows update",
+			currentStatus: acidv1.ClusterStatusRunning,
+			wantBlocked:   false,
+			wantErr:       false,
+		},
+		{
+			name:          "Stopping state, blocks update",
+			currentStatus: acidv1.ClusterStatusStopping,
+			wantBlocked:   true,
+			wantErr:       true,
+			errContains:   "cannot update cluster while it is stopping",
+		},
+		{
+			name:           "Stopped with lifecycle.phase=stopped, blocks update",
+			currentStatus:  acidv1.ClusterStatusStopped,
+			lifecyclePhase: "stopped",
+			wantBlocked:    true,
+			wantErr:        true,
+			errContains:    "cannot update cluster while stopped",
+		},
+		{
+			name:           "Stopped without lifecycle.phase, allows update (wake-up)",
+			currentStatus:  acidv1.ClusterStatusStopped,
+			lifecyclePhase: "",
+			wantBlocked:    false,
+			wantErr:        false,
+		},
+		{
+			name:          "UpdateFailed state, allows update",
+			currentStatus: acidv1.ClusterStatusUpdateFailed,
+			wantBlocked:   false,
+			wantErr:       false,
+		},
 	}
 
-	makeCluster := func(t *testing.T) (*Cluster, *fake.Clientset) {
-		t.Helper()
-		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
-		return &Cluster{
-			logger:     lifecycleLogger,
-			KubeClient: *kubeClient,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
-			},
-		}, clientSet
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, _, _ := newFakeK8sClientForLifecycle()
+			c := newLifecycleCluster(client, tt.currentStatus, 3, tt.lifecyclePhase, 0, nil)
+
+			newSpec := c.Postgresql.DeepCopy()
+			if tt.lifecyclePhase != "" && tt.currentStatus != acidv1.ClusterStatusStopped {
+				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: tt.lifecyclePhase}
+			}
+
+			blocked, err := c.blockLifecycleUpdate(newSpec)
+
+			if tt.wantErr {
+				assert.Error(t, err)
+				if tt.errContains != "" {
+					assert.Contains(t, err.Error(), tt.errContains)
+				}
+			} else {
+				assert.NoError(t, err)
+			}
+			assert.Equal(t, tt.wantBlocked, blocked)
+		})
 	}
-
-	t.Run("success: populates cache from API when c.Statefulset is nil", func(t *testing.T) {
-		c, clientSet := makeCluster(t)
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
-		assert.NoError(t, err)
-		assert.Nil(t, c.Statefulset)
-
-		assert.NoError(t, c.refreshStatefulset())
-		assert.NotNil(t, c.Statefulset)
-		assert.Equal(t, stsName, c.Statefulset.Name)
-		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas)
-	})
-
-	t.Run("success: overwrites stale cache with fresh API value", func(t *testing.T) {
-		c, clientSet := makeCluster(t)
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
-		assert.NoError(t, err)
-		// Stale cache says replicas=3
-		c.Statefulset = makeSTS(int32Ptr(3))
-
-		assert.NoError(t, c.refreshStatefulset())
-		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas, "should reflect API value, not cached value")
-	})
-
-	t.Run("not found: clears cache and returns nil", func(t *testing.T) {
-		c, _ := makeCluster(t)
-		c.Statefulset = makeSTS(int32Ptr(2)) // stale cache
-		assert.NotNil(t, c.Statefulset)
-
-		assert.NoError(t, c.refreshStatefulset())
-		assert.Nil(t, c.Statefulset, "cache should be cleared when STS is missing")
-	})
-
-	t.Run("not found from nil: leaves cache nil, returns nil", func(t *testing.T) {
-		c, _ := makeCluster(t)
-		assert.Nil(t, c.Statefulset)
-
-		assert.NoError(t, c.refreshStatefulset())
-		assert.Nil(t, c.Statefulset)
-	})
 }
 
-func TestCheckStoppingCompleted(t *testing.T) {
-	const stsName = "test-cluster"
+func TestLifecycleUpdateBlocksDuringStopping(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, "stopped", 3, nil)
 
-	makeSTS := func(replicas *int32) *appsv1.StatefulSet {
-		return &appsv1.StatefulSet{
-			ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
-			Spec:       appsv1.StatefulSetSpec{Replicas: replicas},
-		}
-	}
+	newSpec := c.Postgresql.DeepCopy()
+	blocked, err := c.blockLifecycleUpdate(newSpec)
 
-	makeCluster := func(t *testing.T) (*Cluster, *fake.Clientset) {
-		t.Helper()
-		kubeClient, clientSet, _ := newFakeK8sClientForLifecycle()
-		return &Cluster{
-			logger:     lifecycleLogger,
-			KubeClient: *kubeClient,
-			Postgresql: acidv1.Postgresql{
-				ObjectMeta: metav1.ObjectMeta{Name: stsName, Namespace: "default"},
-			},
-		}, clientSet
-	}
+	assert.True(t, blocked)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot update cluster while it is stopping")
+}
 
-	stoppingStatus := acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusStopping}
-	runningStatus := acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning}
+func TestLifecycleUpdateBlocksWhenStoppedWithPhase(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "stopped", 3, nil)
 
-	t.Run("fast path: status not Stopping returns false without touching cache", func(t *testing.T) {
-		c, _ := makeCluster(t)
-		// Pre-populate cache to prove it's not refreshed
-		c.Statefulset = makeSTS(int32Ptr(0))
+	newSpec := c.Postgresql.DeepCopy()
+	blocked, err := c.blockLifecycleUpdate(newSpec)
 
-		done, err := c.checkStoppingCompleted(&runningStatus)
-		assert.NoError(t, err)
-		assert.False(t, done)
-		assert.NotNil(t, c.Statefulset, "fast path should not refresh the cache")
-	})
+	assert.True(t, blocked)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "cannot update cluster while stopped")
+}
 
-	t.Run("Stopping with API replicas=0 returns true (operator-restart scenario)", func(t *testing.T) {
-		c, clientSet := makeCluster(t)
-		// Operator just restarted: c.Statefulset is nil.
-		// API has the truth: replicas=0.
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
-		assert.NoError(t, err)
-		assert.Nil(t, c.Statefulset)
+func TestLifecycleUpdateAllowsWakeUp(t *testing.T) {
+	client, _, _ := newFakeK8sClientForLifecycle()
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "", 3, nil)
 
-		done, err := c.checkStoppingCompleted(&stoppingStatus)
-		assert.NoError(t, err)
-		assert.True(t, done, "should transition to Stopped based on fresh API value")
-		assert.NotNil(t, c.Statefulset, "cache should be populated after refresh")
-	})
+	newSpec := c.Postgresql.DeepCopy()
+	blocked, err := c.blockLifecycleUpdate(newSpec)
 
-	t.Run("Stopping with API replicas=2 returns false", func(t *testing.T) {
-		c, clientSet := makeCluster(t)
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(2)), metav1.CreateOptions{})
-		assert.NoError(t, err)
-
-		done, err := c.checkStoppingCompleted(&stoppingStatus)
-		assert.NoError(t, err)
-		assert.False(t, done)
-	})
-
-	t.Run("Stopping with stale cache (replicas=2) but API says 0 returns true", func(t *testing.T) {
-		c, clientSet := makeCluster(t)
-		_, err := clientSet.AppsV1().StatefulSets("default").Create(context.TODO(), makeSTS(int32Ptr(0)), metav1.CreateOptions{})
-		assert.NoError(t, err)
-		// Stale cache says replicas=2 (e.g. another operator pod restarted and
-		// cached the pre-hibernate state).
-		c.Statefulset = makeSTS(int32Ptr(2))
-
-		done, err := c.checkStoppingCompleted(&stoppingStatus)
-		assert.NoError(t, err)
-		assert.True(t, done, "should use fresh API value, not stale cache")
-		assert.Equal(t, int32(0), *c.Statefulset.Spec.Replicas)
-	})
-
-	t.Run("Stopping with STS missing in API returns false", func(t *testing.T) {
-		c, _ := makeCluster(t)
-		c.Statefulset = makeSTS(int32Ptr(2))
-
-		done, err := c.checkStoppingCompleted(&stoppingStatus)
-		assert.NoError(t, err)
-		assert.False(t, done)
-		assert.Nil(t, c.Statefulset, "cache should be cleared when STS is missing")
-	})
+	assert.False(t, blocked)
+	assert.NoError(t, err)
 }

@@ -469,6 +469,29 @@ func (c *Cluster) waitStatefulsetPodsReady() error {
 	return nil
 }
 
+// waitStatefulsetPodsGone blocks until the StatefulSet reports zero replicas in
+// its Status (i.e. all pods have been terminated) or the wait times out. Each
+// iteration refreshes c.Statefulset so the in-memory cache stays current.
+// NotFound is treated as success (the cluster may have been deleted entirely).
+// On timeout, returns an error so callers can surface it to the controller.
+func (c *Cluster) waitStatefulsetPodsGone() error {
+	c.setProcessName("waiting for statefulset pods to terminate")
+	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
+		func() (bool, error) {
+			sts, err := c.KubeClient.StatefulSets(c.Namespace).Get(
+				context.TODO(), c.statefulSetName(), metav1.GetOptions{})
+			if err != nil {
+				if k8sutil.ResourceNotFound(err) {
+					c.Statefulset = nil
+					return true, nil
+				}
+				return false, fmt.Errorf("could not get statefulset: %w", err)
+			}
+			c.Statefulset = sts
+			return sts.Status.Replicas == 0, nil
+		})
+}
+
 // Returns labels used to create or list k8s objects such as pods
 // For backward compatibility, shouldAddExtraLabels must be false
 // when listing k8s objects. See operator PR #252

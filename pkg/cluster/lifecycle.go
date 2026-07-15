@@ -9,7 +9,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 
 	acidv1 "github.com/zalando/postgres-operator/pkg/apis/acid.zalan.do/v1"
-	"github.com/zalando/postgres-operator/pkg/util/k8sutil"
 )
 
 // LifecycleAction represents the detected lifecycle transition for a cluster.
@@ -59,52 +58,106 @@ func detectLifecycleTransition(
 	return LifecycleActionNone
 }
 
-// detectStoppingCompleted checks if the cluster should transition from Stopping to Stopped.
-// This happens when the StatefulSet replicas have actually reached 0 (all pods terminated).
-func detectStoppingCompleted(currentStatus *acidv1.PostgresStatus, statefulsetReplicas *int32) bool {
-	if !currentStatus.Stopping() {
-		return false
-	}
-	if statefulsetReplicas == nil {
-		return false
-	}
-	return *statefulsetReplicas == 0
-}
+// handleHibernateAndWakeUp detects a hibernate/wake-up transition and asks
+// syncStateLocked to mutate + persist the spec+status and run the full sync
+// body.
+// For hibernate it then waits inline for pods to terminate and persist Stopped.
+// For wake-up the sync's existing defer transitions Updating → Running
+// once resources exist.
+//
+// Returns (handled bool, err error):
+//   - (true, nil)   lifecycle transition completed; Update() should return early
+//   - (false, nil)  no lifecycle transition; Update() proceeds normally
+//   - (true, err)   transition attempted but failed; caller returns the error
+func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, error) {
+	action := detectLifecycleTransition(
+		&c.Status,
+		newSpec.Spec.Lifecycle,
+		newSpec.Spec.NumberOfInstances,
+		newSpec.Status.PreviousNumberOfInstances,
+	)
 
-// refreshStatefulset fetches the latest StatefulSet from the API and updates c.Statefulset.
-// The in-memory c.Statefulset cache is only populated by Create() and by Sync() inside
-// syncStatefulSet(); after an operator restart the cache is nil, and Sync() calls
-// manageHibernateState before reaching syncStatefulSet(). Without this refresh,
-// detectStoppingCompleted would see stale (or nil) replica counts and never transition
-// to Stopped. If the StatefulSet is not found in the API, the cache is cleared and
-// nil is returned (the cluster may have been deleted).
-func (c *Cluster) refreshStatefulset() error {
-	sset, err := c.KubeClient.StatefulSets(c.Namespace).Get(
-		context.TODO(), c.statefulSetName(), metav1.GetOptions{})
-	if err != nil {
-		if k8sutil.ResourceNotFound(err) {
-			c.Statefulset = nil
-			return nil
-		}
-		return fmt.Errorf("could not refresh statefulset: %w", err)
-	}
-	c.Statefulset = sset
-	return nil
-}
-
-// checkStoppingCompleted is an I/O wrapper around detectStoppingCompleted. It refreshes
-// the StatefulSet cache before delegating so callers see fresh replica counts, especially
-// after an operator restart where c.Statefulset is nil. To avoid an extra API call on the
-// hot Update/Sync path, the refresh is skipped when status is not Stopping (the only
-// state where detectStoppingCompleted can return true).
-func (c *Cluster) checkStoppingCompleted(currentStatus *acidv1.PostgresStatus) (bool, error) {
-	if !currentStatus.Stopping() {
+	if action == LifecycleActionNone {
 		return false, nil
 	}
-	if err := c.refreshStatefulset(); err != nil {
-		return false, err
+
+	// syncStateLocked → prepareLifecycleTransition: detects the transition,
+	// mutates the spec via initiateHibernate/initiateWakeUp, and immediately
+	// persists spec+status.
+	if err := c.syncStateLocked(newSpec); err != nil {
+		return true, fmt.Errorf("could not sync after lifecycle transition: %w", err)
 	}
-	return detectStoppingCompleted(currentStatus, c.getStatefulsetReplicas()), nil
+
+	// Hibernate: wait inline for pods to actually terminate and persist Stopped.
+	// Doing this here (outside syncStateLocked) means a timeout returns an error
+	// without triggering the defer's SyncFailed status — the operator controller
+	// requeues and the next Sync (or this same Update on retry) resumes the wait.
+	if action == LifecycleActionHibernate {
+		if err := c.completeStoppingTransition(newSpec); err != nil {
+			return true, fmt.Errorf("hibernate failed: %w", err)
+		}
+	}
+
+	return true, nil
+}
+
+// prepareLifecycleTransition inspects newSpec for a lifecycle transition
+// On detection it mutates the in-memory spec via initiateHibernate/initiateWakeUp
+// and immediately persists BOTH spec and status to the K8s API so the new status 
+// (Stopping/Updating) is visible in same reconciliation pass — without waiting for
+// syncStateLocked's defer.
+// Uses oldSpec for detection so it works correctly when handleHibernateAndWakeUp
+// has already mutated newSpec before calling syncStateLocked.
+//
+// Returns:
+//   - (true,  nil): proceed with the rest of syncStateLocked (no transition,
+//     or transition was persisted)
+//   - (false, nil): skip sync — cluster is Stopped with no transition requested
+//   - (false, err): error persisting the spec or status; caller propagates to
+//     controller (next Update will retry the whole transition)
+func (c *Cluster) prepareLifecycleTransition(newSpec **acidv1.Postgresql, oldSpec acidv1.Postgresql) (bool, error) {
+	spec := *newSpec
+	action := detectLifecycleTransition(
+		&oldSpec.Status,
+		spec.Spec.Lifecycle,
+		spec.Spec.NumberOfInstances,
+		spec.Status.PreviousNumberOfInstances,
+	)
+
+	// Stopped cluster with lifecycle=stopped: no reconciliation work.
+	if action == LifecycleActionNone && c.Status.Stopped() {
+		return false, nil
+	}
+
+	switch action {
+	case LifecycleActionHibernate:
+		c.initiateHibernate(spec)
+	case LifecycleActionWakeUp:
+		c.initiateWakeUp(spec)
+	}
+
+	if action == LifecycleActionHibernate || action == LifecycleActionWakeUp {
+		// Persist spec first (writes numInst/lifecycle + advances rv to N+1),
+		// then write the status subresource (advances rv to N+2).
+		pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), spec)
+		if err != nil {
+			return false, fmt.Errorf("could not update spec for lifecycle action: %w", err)
+		}
+		// UpdatePostgresCR returns the CR with a fresh resourceVersion but the
+		// status subresource may be empty/stale. Re-apply the lifecycle status
+		// fields before writing the status.
+		pgUpdated.Status.PreviousNumberOfInstances = spec.Status.PreviousNumberOfInstances
+		pgUpdated.Status.PreviousPoolerInstances = spec.Status.PreviousPoolerInstances
+		pgUpdated.Status.PostgresClusterStatus = spec.Status.PostgresClusterStatus
+
+		pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
+		if err != nil {
+			return false, fmt.Errorf("could not set status for lifecycle action: %w", err)
+		}
+		c.setSpec(pgUpdated)
+	}
+
+	return true, nil
 }
 
 // initiateHibernate prepares the cluster for hibernation by:
@@ -132,12 +185,16 @@ func (c *Cluster) initiateHibernate(newSpec *acidv1.Postgresql) {
 }
 
 // initiateWakeUp prepares the cluster for wake-up by:
-// - Restoring numberOfInstances from PreviousNumberOfInstances (if > 0)
+//   - Restoring numberOfInstances from PreviousNumberOfInstances (if > 0)
+//   - Scaling up connection pooler deployments (consumes PreviousPoolerInstances)
+//   - Resuming logical backup CronJob
+//   - Setting status to Updating
+//   - Clearing PreviousNumberOfInstances / PreviousPoolerInstances so they don't
+//     linger in the status subresource after the wake-up completes. The next
+//     hibernate overwrites them with fresh values.
 //
-// - Setting status to Updating
-// - Scaling up connection pooler deployments
-// - Resuming logical backup CronJob
-// If PreviousNumberOfInstances is 0, logs a warning but still sets status to Updating.
+// If PreviousNumberOfInstances is 0, logs a warning but still sets status to
+// Updating (operator-restart catch-up may have already cleared it).
 // Errors during pooler/backup operations are logged but do not fail the transition.
 func (c *Cluster) initiateWakeUp(newSpec *acidv1.Postgresql) {
 	if newSpec.Status.PreviousNumberOfInstances > 0 {
@@ -157,62 +214,9 @@ func (c *Cluster) initiateWakeUp(newSpec *acidv1.Postgresql) {
 	if err := c.unsuspendLogicalBackupJob(); err != nil {
 		c.logger.Warningf("[lifecycle] failed to resume logical backup job: %v", err)
 	}
-}
 
-// persistHibernateTransition persists the hibernate transition to Kubernetes by:
-// 1. Updating the PostgresCR spec (numberOfInstances=0, previousNumberOfInstances stored)
-// 2. Updating the PostgresCR status (status=Stopping, previousPoolerInstances stored)
-// 3. Updating the local cluster spec
-// Returns (handled=true, nil) on success, (handled=false, error) on failure.
-func (c *Cluster) persistHibernateTransition(newSpec *acidv1.Postgresql) (bool, error) {
-	pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
-	if err != nil {
-		return false, fmt.Errorf("could not update spec during hibernate: %w", err)
-	}
-
-	pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
-	pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
-	pgUpdated.Status.PreviousPoolerInstances = newSpec.Status.PreviousPoolerInstances
-
-	pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
-	if err != nil {
-		return false, fmt.Errorf("could not update status during hibernate: %w", err)
-	}
-
-	c.setSpec(pgUpdated)
-	c.logger.Infof("[lifecycle] hibernate completed: cluster is stopping, numberOfInstances=0, previousNumberOfInstances=%d",
-		pgUpdated.Status.PreviousNumberOfInstances)
-	return true, nil
-}
-
-// persistWakeUpTransition persists the wake-up transition to Kubernetes by:
-// 1. Clearing PreviousNumberOfInstances and PreviousPoolerInstances
-// 2. Updating the PostgresCR spec (numberOfInstances restored from previous)
-// 3. Updating the PostgresCR status (status=Updating)
-// 4. Updating the local cluster spec
-// Returns (handled=true, nil) on success, (handled=false, error) on failure.
-func (c *Cluster) persistWakeUpTransition(newSpec *acidv1.Postgresql) (bool, error) {
 	newSpec.Status.PreviousNumberOfInstances = 0
 	newSpec.Status.PreviousPoolerInstances = nil
-
-	pgUpdated, err := c.KubeClient.UpdatePostgresCR(c.clusterName(), newSpec)
-	if err != nil {
-		return false, fmt.Errorf("could not update spec during wake-up: %w", err)
-	}
-
-	pgUpdated.Status.PreviousNumberOfInstances = newSpec.Status.PreviousNumberOfInstances
-	pgUpdated.Status.PreviousPoolerInstances = newSpec.Status.PreviousPoolerInstances
-	pgUpdated.Status.PostgresClusterStatus = newSpec.Status.PostgresClusterStatus
-
-	pgUpdated, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), pgUpdated)
-	if err != nil {
-		return false, fmt.Errorf("could not update status during wake-up: %w", err)
-	}
-
-	c.setSpec(pgUpdated)
-	c.logger.Infof("[lifecycle] wake-up completed: cluster is updating, numberOfInstances=%d",
-		pgUpdated.Spec.NumberOfInstances)
-	return true, nil
 }
 
 // persistStoppingCompletedTransition persists the Stopping->Stopped transition to Kubernetes
@@ -230,63 +234,29 @@ func (c *Cluster) persistStoppingCompletedTransition(newSpec *acidv1.Postgresql)
 	return true, nil
 }
 
-// manageHibernateState handles cluster hibernate/wake-up state transitions during Sync().
-// This is the Sync path - it only modifies the in-memory spec.
-//
-// State transitions handled:
-//   - Running -> Stopping: Via initiateHibernate() (when lifecycle.phase="stopped")
-//   - Stopping -> Stopped: When StatefulSet replicas reach 0 (detected here)
-//   - Stopped -> Updating: Via initiateWakeUp() (when lifecycle cleared)
-//
-// Returns the detected LifecycleAction and a boolean indicating whether sync
-// should continue (true) or return early (false, only when cluster is Stopped
-// with lifecycle.phase="stopped" set).
-func (c *Cluster) manageHibernateState(oldSpec acidv1.Postgresql, newSpec *acidv1.Postgresql) (LifecycleAction, bool) {
-	action := detectLifecycleTransition(
-		&newSpec.Status,
-		newSpec.Spec.Lifecycle,
-		newSpec.Spec.NumberOfInstances,
-		newSpec.Status.PreviousNumberOfInstances,
-	)
-
-	switch action {
-	case LifecycleActionHibernate:
-		c.initiateHibernate(newSpec)
-		return action, true
-
-	case LifecycleActionWakeUp:
-		c.initiateWakeUp(newSpec)
-		return action, true
+// completeStoppingTransition waits for the StatefulSet pods to actually terminate
+// and transitions the cluster status from Stopping to Stopped. On timeout, returns
+// an error so the caller can propagate it to the controller which will retry.
+func (c *Cluster) completeStoppingTransition(newSpec *acidv1.Postgresql) error {
+	if err := c.waitStatefulsetPodsGone(); err != nil {
+		return fmt.Errorf("could not wait for pods to terminate: %w", err)
 	}
 
-	// Check if Stopping -> Stopped transition is needed
-	done, err := c.checkStoppingCompleted(&newSpec.Status)
+	// Re-fetch the latest resourceVersion before writing Stopped to stop 409 and drift.
+	latest, err := c.KubeClient.Postgresqls(c.clusterNamespace()).Get(
+		context.TODO(), c.Name, metav1.GetOptions{})
 	if err != nil {
-		// Refresh failed; treat as not-completed and let the next Sync retry.
-		// Not returning the error so we don't mark the cluster SyncFailed on a
-		// transient API hiccup while the cluster is mid-stop.
-		c.logger.Warningf("[lifecycle] could not refresh statefulset for stopping check: %v", err)
-	} else if done {
-		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
-		c.logger.Info("[lifecycle] cluster has stopped, all pods are terminated")
-		return LifecycleActionStoppingCompleted, true
+		return fmt.Errorf("could not refresh postgresql before persisting Stopped: %w", err)
 	}
+	newSpec.ResourceVersion = latest.ResourceVersion
 
-	// Skip sync if cluster is stopped and lifecycle.phase="stopped" is set
-	if newSpec.Status.Stopped() && newSpec.Spec.Lifecycle != nil && newSpec.Spec.Lifecycle.Phase == "stopped" {
-		return LifecycleActionNone, false
+	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
+	c.setSpec(newSpec)
+	if _, err := c.persistStoppingCompletedTransition(newSpec); err != nil {
+		return err
 	}
-
-	return LifecycleActionNone, true
-}
-
-// getStatefulsetReplicas returns the current replica count from the StatefulSet.
-// Returns nil if StatefulSet is nil or Replicas field is nil.
-func (c *Cluster) getStatefulsetReplicas() *int32 {
-	if c.Statefulset == nil || c.Statefulset.Spec.Replicas == nil {
-		return nil
-	}
-	return c.Statefulset.Spec.Replicas
+	c.logger.Info("[lifecycle] cluster has stopped")
+	return nil
 }
 
 // suspendLogicalBackupJob suspends the logical backup CronJob by setting spec.suspend=true.
@@ -311,7 +281,7 @@ func (c *Cluster) suspendLogicalBackupJob() error {
 		return fmt.Errorf("could not get logical backup job: %w", err)
 	}
 
-	patchData := fmt.Sprintf(`{"spec":{"suspend":true}}`)
+	patchData := `{"spec":{"suspend":true}}`
 	cronJob, err := c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Patch(
 		context.TODO(),
 		c.getLogicalBackupJobName(),
@@ -351,7 +321,7 @@ func (c *Cluster) unsuspendLogicalBackupJob() error {
 		return fmt.Errorf("could not get logical backup job: %w", err)
 	}
 
-	patchData := fmt.Sprintf(`{"spec":{"suspend":false}}`)
+	patchData := `{"spec":{"suspend":false}}`
 	cronJob, err := c.KubeClient.CronJobsGetter.CronJobs(c.Namespace).Patch(
 		context.TODO(),
 		c.getLogicalBackupJobName(),
@@ -448,4 +418,3 @@ func (c *Cluster) patchPoolerReplicas(role PostgresRole, replicas int32) error {
 	}
 	return nil
 }
-
