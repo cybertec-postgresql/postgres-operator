@@ -48,15 +48,15 @@ func newFakeK8sClientForLifecycle() (*k8sutil.KubernetesClient, *fake.Clientset,
 	acidClientSet := fakeacidv1.NewSimpleClientset()
 
 	client := &k8sutil.KubernetesClient{
-		DeploymentsGetter:   clientSet.AppsV1(),
-		PostgresqlsGetter:   acidClientSet.AcidV1(),
-		StatefulSetsGetter:  clientSet.AppsV1(),
-		ServicesGetter:      clientSet.CoreV1(),
-		SecretsGetter:       clientSet.CoreV1(),
-		ConfigMapsGetter:    clientSet.CoreV1(),
-		PodsGetter:          clientSet.CoreV1(),
-		EndpointsGetter:     clientSet.CoreV1(),
-		CronJobsGetter:      clientSet.BatchV1(),
+		DeploymentsGetter:  clientSet.AppsV1(),
+		PostgresqlsGetter:  acidClientSet.AcidV1(),
+		StatefulSetsGetter: clientSet.AppsV1(),
+		ServicesGetter:     clientSet.CoreV1(),
+		SecretsGetter:      clientSet.CoreV1(),
+		ConfigMapsGetter:   clientSet.CoreV1(),
+		PodsGetter:         clientSet.CoreV1(),
+		EndpointsGetter:    clientSet.CoreV1(),
+		CronJobsGetter:     clientSet.BatchV1(),
 	}
 
 	return client, clientSet, acidClientSet
@@ -105,7 +105,7 @@ func newLifecycleCluster(
 	return &Cluster{
 		Config: Config{
 			OpConfig: config.Config{
-				PodManagementPolicy:    "ordered_ready",
+				PodManagementPolicy: "ordered_ready",
 				LogicalBackup: config.LogicalBackup{
 					LogicalBackupJobPrefix: "logical-backup-",
 				},
@@ -253,9 +253,9 @@ func TestInitiateWakeUp(t *testing.T) {
 				NumberOfInstances: 0,
 			},
 			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus:      acidv1.ClusterStatusStopped,
-				PreviousNumberOfInstances:  3,
-				PreviousPoolerInstances:    map[string]int32{"master": 2, "replica": 0},
+				PostgresClusterStatus:     acidv1.ClusterStatusStopped,
+				PreviousNumberOfInstances: 3,
+				PreviousPoolerInstances:   map[string]int32{"master": 2, "replica": 0},
 			},
 		}
 
@@ -277,8 +277,8 @@ func TestInitiateWakeUp(t *testing.T) {
 				NumberOfInstances: 0,
 			},
 			Status: acidv1.PostgresStatus{
-				PostgresClusterStatus:     acidv1.ClusterStatusStopped,
-				PreviousPoolerInstances:   map[string]int32{"master": 1},
+				PostgresClusterStatus:   acidv1.ClusterStatusStopped,
+				PreviousPoolerInstances: map[string]int32{"master": 1},
 			},
 		}
 

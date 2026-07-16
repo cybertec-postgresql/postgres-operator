@@ -103,7 +103,7 @@ func (c *Cluster) handleHibernateAndWakeUp(newSpec *acidv1.Postgresql) (bool, er
 
 // prepareLifecycleTransition inspects newSpec for a lifecycle transition
 // On detection it mutates the in-memory spec via initiateHibernate/initiateWakeUp
-// and immediately persists BOTH spec and status to the K8s API so the new status 
+// and immediately persists BOTH spec and status to the K8s API so the new status
 // (Stopping/Updating) is visible in same reconciliation pass — without waiting for
 // syncStateLocked's defer.
 // Uses oldSpec for detection so it works correctly when handleHibernateAndWakeUp
