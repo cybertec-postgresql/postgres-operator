@@ -496,11 +496,13 @@ Parameters to control cluster hibernate/wake-up behavior.
   * Store the current number of instances in the status
   * Scale down the StatefulSet to 0 replicas
   * Scale down the connection pooler to 0 replicas
+  * Suspend the logical backup CronJob (if enabled)
   * Set the cluster status to "Stopping", then "Stopped"
 
   When this field is removed from a stopped cluster, the operator will:
   * Restore the number of instances from the stored value
   * Scale up the StatefulSet and connection pooler
+  * Resume the logical backup CronJob (if it was suspended)
   * Set the cluster status to "Updating", then "Running"
 
   This field is optional. When not set, the cluster operates normally.
