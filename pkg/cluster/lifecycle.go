@@ -36,25 +36,23 @@ func detectLifecycleTransition(
 	newSpecNumberOfInstances int32,
 	newSpecPreviousNumberOfInstances int32,
 ) LifecycleAction {
-	isWakingUpSimple := newSpecLifecycle == nil || newSpecLifecycle.Phase != "stopped"
-	hasPreviousInstances := newSpecPreviousNumberOfInstances > 0
-	needsRestore := newSpecNumberOfInstances == 0
+	wantsStopped := newSpecLifecycle != nil && newSpecLifecycle.Phase == "stopped"
 
-	isWakingUp := isWakingUpSimple && hasPreviousInstances && needsRestore
-
-	if currentStatus.Stopped() || isWakingUp {
-		if isWakingUp || newSpecLifecycle == nil || newSpecLifecycle.Phase != "stopped" {
-			return LifecycleActionWakeUp
-		}
+	// The cluster was in the middle of hibernating (already scaled down,
+	// old replica count saved) when the spec changed its mind and no
+	// longer wants it stopped.
+	if !wantsStopped && newSpecPreviousNumberOfInstances > 0 && newSpecNumberOfInstances == 0 {
+		return LifecycleActionWakeUp
 	}
 
-	if newSpecLifecycle != nil &&
-		newSpecLifecycle.Phase == "stopped" &&
-		!currentStatus.Stopping() &&
-		!currentStatus.Stopped() {
+	// Already stopped and the spec no longer asks to stay stopped.
+	if currentStatus.Stopped() && !wantsStopped {
+		return LifecycleActionWakeUp
+	}
+
+	if wantsStopped && !currentStatus.Stopping() && !currentStatus.Stopped() {
 		return LifecycleActionHibernate
 	}
-
 	return LifecycleActionNone
 }
 

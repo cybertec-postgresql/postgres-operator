@@ -199,6 +199,30 @@ func TestDetectLifecycleTransition(t *testing.T) {
 			newPreviousNumberOfInstances: 0,
 			want:                         LifecycleActionWakeUp,
 		},
+		{
+			name:                         "Updating + lifecycle.phase=stopped -> Hibernate (active status, not Running)",
+			currentStatus:                acidv1.ClusterStatusUpdating,
+			newLifecyclePhase:            "stopped",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 0,
+			want:                         LifecycleActionHibernate,
+		},
+		{
+			name:                         "Stopping + lifecycle cleared + has previous instances + numInst=0 -> WakeUp (catch-up during Stopping)",
+			currentStatus:                acidv1.ClusterStatusStopping,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         0,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionWakeUp,
+		},
+		{
+			name:                         "Stopped + lifecycle cleared + has previous instances + numInst>0 -> WakeUp (no restore needed)",
+			currentStatus:                acidv1.ClusterStatusStopped,
+			newLifecyclePhase:            "",
+			newNumberOfInstances:         3,
+			newPreviousNumberOfInstances: 3,
+			want:                         LifecycleActionWakeUp,
+		},
 	}
 
 	for _, tt := range tests {
