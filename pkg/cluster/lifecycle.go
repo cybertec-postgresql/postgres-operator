@@ -364,12 +364,12 @@ func (c *Cluster) scalePoolerDown(newSpec *acidv1.Postgresql) error {
 	for role := range c.ConnectionPooler {
 		replicas := c.getPoolerReplicas(role)
 
-		if newSpec.Status.PreviousPoolerInstances == nil {
-			newSpec.Status.PreviousPoolerInstances = make(map[string]int32)
-		}
-		newSpec.Status.PreviousPoolerInstances[string(role)] = replicas
-
 		if replicas > 0 {
+			if newSpec.Status.PreviousPoolerInstances == nil {
+				newSpec.Status.PreviousPoolerInstances = make(map[string]int32)
+			}
+			newSpec.Status.PreviousPoolerInstances[string(role)] = replicas
+
 			if err := c.patchPoolerReplicas(role, 0); err != nil {
 				return err
 			}

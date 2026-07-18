@@ -637,7 +637,7 @@ func TestScalePoolerDown(t *testing.T) {
 		{
 			name:       "Master already at 0 replicas",
 			poolerObjs: map[PostgresRole]*ConnectionPoolerObjects{Master: newTestPoolerObjects(Master, 0)},
-			wantStored: map[string]int32{"master": 0},
+			wantStored: nil,
 		},
 		{
 			name: "Both Master and Replica",

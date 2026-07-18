@@ -501,7 +501,7 @@ Parameters to control cluster hibernate/wake-up behavior.
 
   When this field is removed, or set to an empty string, on a stopped
   cluster, the operator will:
-  * Restore the number of instances from the stored value
+  * Restore the number of instances from `status.previousNumberOfInstances`
   * Scale up the StatefulSet and connection pooler
   * Resume the logical backup CronJob (if it was suspended)
   * Set the cluster status to "Updating", then "Running"
@@ -511,6 +511,11 @@ Parameters to control cluster hibernate/wake-up behavior.
   Note: the CRD schema accepts `""` as well as `"stopped"` for `lifecycle.phase`.
   Both forms are equivalent to omitting the field, and either form triggers the
   wake-up path described above.
+
+  Note: if `status.previousNumberOfInstances` is 0 (for example due to a partial
+  write or a manual edit), the operator will not transition the cluster out of
+  `Stopped`. Edit `spec.numberOfInstances` to a positive value to wake it up
+  manually.
 
 ## Volume properties
 

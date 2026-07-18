@@ -65,11 +65,13 @@ func (c *Cluster) syncStateLocked(newSpec *acidv1.Postgresql) error {
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusSyncFailed
 		} else if !c.Status.Running() && !c.Status.Stopping() && !c.Status.Stopped() &&
 			oldSpec.Spec.NumberOfInstances > 0 {
-			// Wake-up Updates carry oldSpec.Spec.NumberOfInstances == 0 because
-			// initiateWakeUp hasn't mutated newSpec yet when oldSpec was captured
-			// Skip the Updating->Running transition here: the cluster
-			// isn't ready (pods are still starting), the write would 409 on stale
-			// rv, and the next periodic Sync writes Running with fresh rv.
+			// oldSpec is the snapshot taken at the top of syncStateLocked.
+			// During wake-up, oldSpec.Spec.NumberOfInstances == 0 because
+			// c.Postgresql was already hibernated (spec scaled to 0) when this
+			// reconcile started. Skip the Updating->Running transition in
+			// that case: the cluster isn't ready (pods are still starting),
+			// the write would 409 on stale rv, and the next periodic Sync
+			// writes Running with fresh rv.
 			newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusRunning
 		}
 
