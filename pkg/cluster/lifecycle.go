@@ -46,7 +46,10 @@ func detectLifecycleTransition(
 	}
 
 	// Already stopped and the spec no longer asks to stay stopped.
-	if currentStatus.Stopped() && !wantsStopped {
+	// Require PreviousNumberOfInstances > 0: without it we can't restore the
+	// replica count, and transitioning to Updating with 0 replicas leaves the
+	// cluster stuck (the sync defer skips Running when oldSpec had 0 instances).
+	if currentStatus.Stopped() && !wantsStopped && newSpecPreviousNumberOfInstances > 0 {
 		return LifecycleActionWakeUp
 	}
 
@@ -192,7 +195,8 @@ func (c *Cluster) initiateHibernate(newSpec *acidv1.Postgresql) {
 //     hibernate overwrites them with fresh values.
 //
 // If PreviousNumberOfInstances is 0, logs a warning but still sets status to
-// Updating (operator-restart catch-up may have already cleared it).
+// Updating. (detectLifecycleTransition refuses to return WakeUp in this case,
+// so this branch should not normally be reached.)
 // Errors during pooler/backup operations are logged but do not fail the transition.
 func (c *Cluster) initiateWakeUp(newSpec *acidv1.Postgresql) {
 	if newSpec.Status.PreviousNumberOfInstances > 0 {

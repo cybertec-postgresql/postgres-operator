@@ -192,12 +192,12 @@ func TestDetectLifecycleTransition(t *testing.T) {
 			want:                         LifecycleActionNone,
 		},
 		{
-			name:                         "Stopped + lifecycle cleared + no previous instances -> WakeUp (operator restart catch-up)",
+			name:                         "Stopped + lifecycle cleared + no previous instances -> None (cannot restore)",
 			currentStatus:                acidv1.ClusterStatusStopped,
 			newLifecyclePhase:            "",
 			newNumberOfInstances:         0,
 			newPreviousNumberOfInstances: 0,
-			want:                         LifecycleActionWakeUp,
+			want:                         LifecycleActionNone,
 		},
 		{
 			name:                         "Updating + lifecycle.phase=stopped -> Hibernate (active status, not Running)",
