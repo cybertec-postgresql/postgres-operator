@@ -1057,8 +1057,14 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 		c.setSpec(newSpec)
 	} else {
 		cached, _ := c.GetSpec()
-		cached.Spec = newSpec.Spec
-		c.setSpec(cached)
+		// Watch delivered newSpec with a stale lifecycle Status (e.g. Updating
+		// while c.Status is already Running). Preserve the authoritative
+		// c.Status; take ObjectMeta, Spec, and TypeMeta from newSpec so user
+		// edits to labels, annotations, finalizers, etc. made during an
+		// in-flight lifecycle aren't silently dropped.
+		merged := newSpec.DeepCopy()
+		merged.Status = cached.Status
+		c.setSpec(merged)
 	}
 
 	defer func() {
