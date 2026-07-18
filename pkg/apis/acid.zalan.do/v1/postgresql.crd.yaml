@@ -3251,6 +3251,11 @@ spec:
                   cluster.
                 properties:
                   phase:
+                    description: LifecyclePhase describes the desired lifecycle state
+                      of a Postgres cluster.
+                    enum:
+                    - ""
+                    - stopped
                     type: string
                 type: object
               logicalBackupRetention:

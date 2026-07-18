@@ -499,13 +499,18 @@ Parameters to control cluster hibernate/wake-up behavior.
   * Suspend the logical backup CronJob (if enabled)
   * Set the cluster status to "Stopping", then "Stopped"
 
-  When this field is removed from a stopped cluster, the operator will:
+  When this field is removed, or set to an empty string, on a stopped
+  cluster, the operator will:
   * Restore the number of instances from the stored value
   * Scale up the StatefulSet and connection pooler
   * Resume the logical backup CronJob (if it was suspended)
   * Set the cluster status to "Updating", then "Running"
 
   This field is optional. When not set, the cluster operates normally.
+
+  Note: the CRD schema accepts `""` as well as `"stopped"` for `lifecycle.phase`.
+  Both forms are equivalent to omitting the field, and either form triggers the
+  wake-up path described above.
 
 ## Volume properties
 

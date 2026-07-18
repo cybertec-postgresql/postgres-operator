@@ -111,6 +111,11 @@ func (postgresStatus PostgresStatus) Stopped() bool {
 	return postgresStatus.PostgresClusterStatus == ClusterStatusStopped
 }
 
+// Stopped reports whether this phase requests hibernation.
+func (p LifecyclePhase) Stopped() bool {
+	return p == LifecyclePhaseStopped
+}
+
 func (postgresStatus PostgresStatus) String() string {
 	return postgresStatus.PostgresClusterStatus
 }

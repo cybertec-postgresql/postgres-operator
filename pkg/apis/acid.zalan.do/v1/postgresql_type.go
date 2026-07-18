@@ -260,7 +260,8 @@ type StandbyDescription struct {
 
 // LifecycleSpec describes the lifecycle state of a Postgres cluster.
 type LifecycleSpec struct {
-	Phase string `json:"phase,omitempty"`
+	// +kubebuilder:validation:Enum="";stopped
+	Phase LifecyclePhase `json:"phase,omitempty"`
 }
 
 // TLSDescription specs TLS properties

@@ -149,6 +149,40 @@ var postgresStatus = []struct {
 	{"cluster status empty", []byte(`""`),
 		PostgresStatus{PostgresClusterStatus: ClusterStatusUnknown}, nil}}
 
+var lifecyclePhases = []struct {
+	about string
+	in    LifecyclePhase
+	out   bool
+}{
+	{"empty phase is not stopped", "", false},
+	{"stopped phase is stopped", LifecyclePhaseStopped, true},
+	{"unknown phase is not stopped", LifecyclePhase("running"), false},
+	{"stopped with different casing is not stopped", LifecyclePhase("STOPPED"), false},
+}
+
+var lifecycleSpecJSON = []struct {
+	about   string
+	in      []byte
+	out     LifecycleSpec
+	marshal []byte
+	err     error
+}{
+	{
+		about:   "phase stopped unmarshals correctly",
+		in:      []byte(`{"phase":"stopped"}`),
+		out:     LifecycleSpec{Phase: LifecyclePhaseStopped},
+		marshal: []byte(`{"phase":"stopped"}`),
+		err:     nil,
+	},
+	{
+		about:   "empty phase unmarshals correctly",
+		in:      []byte(`{"phase":""}`),
+		out:     LifecycleSpec{Phase: ""},
+		marshal: []byte(`{}`),
+		err:     nil,
+	},
+}
+
 var tmp postgresqlCopy
 var unmarshalCluster = []struct {
 	about   string
@@ -389,6 +423,46 @@ var unmarshalCluster = []struct {
 			Error: "",
 		},
 		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"standby":{"s3_wal_path":"s3://custom/path/to/bucket/"}},"status":{"PostgresClusterStatus":""}}`),
+		err:     nil},
+	{
+		about: "lifecycle with stopped phase",
+		in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "lifecycle": {"phase": "stopped"}}}`),
+		out: Postgresql{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Postgresql",
+				APIVersion: "acid.zalan.do/v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "acid-testcluster1",
+			},
+			Spec: PostgresSpec{
+				TeamID: "acid",
+				Lifecycle: &LifecycleSpec{
+					Phase: LifecyclePhaseStopped,
+				},
+			},
+			Error: "",
+		},
+		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"lifecycle":{"phase":"stopped"}},"status":{"PostgresClusterStatus":""}}`),
+		err:     nil},
+	{
+		about: "lifecycle with empty phase (wake-up signal)",
+		in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "lifecycle": {"phase": ""}}}`),
+		out: Postgresql{
+			TypeMeta: metav1.TypeMeta{
+				Kind:       "Postgresql",
+				APIVersion: "acid.zalan.do/v1",
+			},
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "acid-testcluster1",
+			},
+			Spec: PostgresSpec{
+				TeamID:    "acid",
+				Lifecycle: &LifecycleSpec{Phase: ""},
+			},
+			Error: "",
+		},
+		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"lifecycle":{"phase":""}},"status":{"PostgresClusterStatus":""}}`),
 		err:     nil},
 	{
 		about:   "expect error on malformatted JSON",
@@ -808,5 +882,98 @@ func TestPostgresqlClone(t *testing.T) {
 				t.Errorf("TestPostgresqlClone expected: \n%#v\n, got \n%#v", cp, clone)
 			}
 		})
+	}
+}
+
+func TestLifecyclePhaseStopped(t *testing.T) {
+	for _, tt := range lifecyclePhases {
+		t.Run(tt.about, func(t *testing.T) {
+			if got := tt.in.Stopped(); got != tt.out {
+				t.Errorf("Expected Stopped()=%v, got %v", tt.out, got)
+			}
+		})
+	}
+}
+
+func TestLifecyclePhaseConstantValue(t *testing.T) {
+	if LifecyclePhaseStopped != "stopped" {
+		t.Errorf("Expected LifecyclePhaseStopped=%q, got %q", "stopped", LifecyclePhaseStopped)
+	}
+	if string(LifecyclePhaseStopped) != "stopped" {
+		t.Errorf("Expected string(LifecyclePhaseStopped)=%q, got %q", "stopped", string(LifecyclePhaseStopped))
+	}
+}
+
+func TestLifecycleSpecJSONRoundTrip(t *testing.T) {
+	for _, tt := range lifecycleSpecJSON {
+		t.Run(tt.about, func(t *testing.T) {
+			var ls LifecycleSpec
+			err := json.Unmarshal(tt.in, &ls)
+			if err != nil {
+				if tt.err == nil || err.Error() != tt.err.Error() {
+					t.Errorf("Unmarshal expected error: %v, got: %v", tt.err, err)
+				}
+				return
+			} else if tt.err != nil {
+				t.Errorf("Expected error: %v", tt.err)
+			}
+
+			if ls != tt.out {
+				t.Errorf("Expected LifecycleSpec: %#v, got %#v", tt.out, ls)
+			}
+
+			s, err := json.Marshal(tt.out)
+			if err != nil {
+				t.Errorf("Marshal error: %v", err)
+			}
+			if !bytes.Equal(s, tt.marshal) {
+				t.Errorf("Expected Marshal: %q, got: %q", string(tt.marshal), string(s))
+			}
+		})
+	}
+}
+
+func TestPostgresStatusDeepCopy(t *testing.T) {
+	orig := &PostgresStatus{
+		PostgresClusterStatus: ClusterStatusStopped,
+		PreviousPoolerInstances: map[string]int32{
+			"acid-cluster-1": 2,
+			"acid-cluster-2": 3,
+		},
+	}
+
+	cp := orig.DeepCopy()
+
+	if cp == orig {
+		t.Fatal("DeepCopy should return a different pointer")
+	}
+	if cp.PostgresClusterStatus != orig.PostgresClusterStatus {
+		t.Errorf("Expected PostgresClusterStatus to match: got %q, want %q",
+			cp.PostgresClusterStatus, orig.PostgresClusterStatus)
+	}
+	if len(cp.PreviousPoolerInstances) != len(orig.PreviousPoolerInstances) {
+		t.Fatalf("Expected %d entries in copy, got %d",
+			len(orig.PreviousPoolerInstances), len(cp.PreviousPoolerInstances))
+	}
+
+	cp.PreviousPoolerInstances["acid-cluster-3"] = 4
+	cp.PreviousPoolerInstances["acid-cluster-1"] = 99
+
+	if _, ok := orig.PreviousPoolerInstances["acid-cluster-3"]; ok {
+		t.Errorf("DeepCopy shared map: adding to copy leaked entry into original")
+	}
+	if orig.PreviousPoolerInstances["acid-cluster-1"] != 2 {
+		t.Errorf("DeepCopy shared map: expected acid-cluster-1=2 in original, got %d",
+			orig.PreviousPoolerInstances["acid-cluster-1"])
+	}
+
+	nilStatus := &PostgresStatus{}
+	nilCp := nilStatus.DeepCopy()
+	if nilCp == nil {
+		t.Fatal("DeepCopy of zero-value PostgresStatus should not return nil")
+	}
+	if !reflect.DeepEqual(nilStatus, nilCp) {
+		t.Errorf("DeepCopy of zero-value PostgresStatus should match: got %#v, want %#v",
+			nilCp, nilStatus)
 	}
 }

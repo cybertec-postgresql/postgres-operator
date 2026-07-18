@@ -1274,7 +1274,7 @@ func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error)
 		return false, nil
 	}
 
-	lifecyclePhase := ""
+	var lifecyclePhase acidv1.LifecyclePhase
 	if newSpec.Spec.Lifecycle != nil {
 		lifecyclePhase = newSpec.Spec.Lifecycle.Phase
 	}
@@ -1285,8 +1285,8 @@ func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error)
 	}
 
 	// During Stopped: only block if keeping lifecycle.phase="stopped"
-	if lifecyclePhase == "stopped" {
-		return true, fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase to wake up the cluster")
+	if lifecyclePhase == acidv1.LifecyclePhaseStopped {
+		return true, fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase or set it to an empty string to wake up the cluster")
 	}
 
 	return false, nil

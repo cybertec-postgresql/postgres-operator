@@ -69,7 +69,7 @@ func newLifecycleCluster(
 	client *k8sutil.KubernetesClient,
 	status string,
 	numberOfInstances int32,
-	lifecyclePhase string,
+	lifecyclePhase acidv1.LifecyclePhase,
 	previousNumberOfInstances int32,
 	previousPoolerInstances map[string]int32,
 ) *Cluster {
@@ -122,7 +122,7 @@ func TestDetectLifecycleTransition(t *testing.T) {
 	tests := []struct {
 		name                         string
 		currentStatus                string
-		newLifecyclePhase            string // "" means nil lifecycle
+		newLifecyclePhase            acidv1.LifecyclePhase // "" means nil lifecycle
 		newNumberOfInstances         int32
 		newPreviousNumberOfInstances int32
 		want                         LifecycleAction
@@ -130,7 +130,7 @@ func TestDetectLifecycleTransition(t *testing.T) {
 		{
 			name:                         "Running + lifecycle.phase=stopped -> Hibernate",
 			currentStatus:                acidv1.ClusterStatusRunning,
-			newLifecyclePhase:            "stopped",
+			newLifecyclePhase:            acidv1.LifecyclePhaseStopped,
 			newNumberOfInstances:         3,
 			newPreviousNumberOfInstances: 0,
 			want:                         LifecycleActionHibernate,
@@ -146,7 +146,7 @@ func TestDetectLifecycleTransition(t *testing.T) {
 		{
 			name:                         "Stopping + lifecycle.phase=stopped -> None (already stopping)",
 			currentStatus:                acidv1.ClusterStatusStopping,
-			newLifecyclePhase:            "stopped",
+			newLifecyclePhase:            acidv1.LifecyclePhaseStopped,
 			newNumberOfInstances:         0,
 			newPreviousNumberOfInstances: 3,
 			want:                         LifecycleActionNone,
@@ -154,7 +154,7 @@ func TestDetectLifecycleTransition(t *testing.T) {
 		{
 			name:                         "Stopped + lifecycle.phase=stopped -> None (still hibernated)",
 			currentStatus:                acidv1.ClusterStatusStopped,
-			newLifecyclePhase:            "stopped",
+			newLifecyclePhase:            acidv1.LifecyclePhaseStopped,
 			newNumberOfInstances:         0,
 			newPreviousNumberOfInstances: 3,
 			want:                         LifecycleActionNone,
@@ -202,7 +202,7 @@ func TestDetectLifecycleTransition(t *testing.T) {
 		{
 			name:                         "Updating + lifecycle.phase=stopped -> Hibernate (active status, not Running)",
 			currentStatus:                acidv1.ClusterStatusUpdating,
-			newLifecyclePhase:            "stopped",
+			newLifecyclePhase:            acidv1.LifecyclePhaseStopped,
 			newNumberOfInstances:         3,
 			newPreviousNumberOfInstances: 0,
 			want:                         LifecycleActionHibernate,
@@ -320,7 +320,7 @@ func TestPrepareLifecycleTransition_Hibernate(t *testing.T) {
 	c := newLifecycleCluster(client, acidv1.ClusterStatusRunning, 3, "", 0, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
-	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: "stopped"}
+	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: acidv1.LifecyclePhaseStopped}
 
 	oldSpec := acidv1.Postgresql{
 		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning},
@@ -381,7 +381,7 @@ func TestPrepareLifecycleTransition_StoppedNoTransition(t *testing.T) {
 		client,
 		acidv1.ClusterStatusStopped,
 		0,
-		"stopped",
+		acidv1.LifecyclePhaseStopped,
 		3,
 		nil,
 	)
@@ -441,7 +441,7 @@ func TestPrepareLifecycleTransition_UpdateSpecFails(t *testing.T) {
 	})
 
 	newSpec := c.Postgresql.DeepCopy()
-	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: "stopped"}
+	newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: acidv1.LifecyclePhaseStopped}
 
 	oldSpec := acidv1.Postgresql{
 		Status: acidv1.PostgresStatus{PostgresClusterStatus: acidv1.ClusterStatusRunning},
@@ -456,7 +456,7 @@ func TestPrepareLifecycleTransition_UpdateSpecFails(t *testing.T) {
 
 func TestPersistStoppingCompletedTransition(t *testing.T) {
 	client, _, _ := newFakeK8sClientForLifecycle()
-	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, "stopped", 3, nil)
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, acidv1.LifecyclePhaseStopped, 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
 	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusStopped
@@ -930,7 +930,7 @@ func TestBlockLifecycleUpdate(t *testing.T) {
 	tests := []struct {
 		name           string
 		currentStatus  string
-		lifecyclePhase string
+		lifecyclePhase acidv1.LifecyclePhase
 		wantBlocked    bool
 		wantErr        bool
 		errContains    string
@@ -951,7 +951,7 @@ func TestBlockLifecycleUpdate(t *testing.T) {
 		{
 			name:           "Stopped with lifecycle.phase=stopped, blocks update",
 			currentStatus:  acidv1.ClusterStatusStopped,
-			lifecyclePhase: "stopped",
+			lifecyclePhase: acidv1.LifecyclePhaseStopped,
 			wantBlocked:    true,
 			wantErr:        true,
 			errContains:    "cannot update cluster while stopped",
@@ -998,7 +998,7 @@ func TestBlockLifecycleUpdate(t *testing.T) {
 
 func TestLifecycleUpdateBlocksDuringStopping(t *testing.T) {
 	client, _, _ := newFakeK8sClientForLifecycle()
-	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, "stopped", 3, nil)
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, acidv1.LifecyclePhaseStopped, 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
 	blocked, err := c.blockLifecycleUpdate(newSpec)
@@ -1010,7 +1010,7 @@ func TestLifecycleUpdateBlocksDuringStopping(t *testing.T) {
 
 func TestLifecycleUpdateBlocksWhenStoppedWithPhase(t *testing.T) {
 	client, _, _ := newFakeK8sClientForLifecycle()
-	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "stopped", 3, nil)
+	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, acidv1.LifecyclePhaseStopped, 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
 	blocked, err := c.blockLifecycleUpdate(newSpec)
