@@ -924,9 +924,9 @@ func TestUnsuspendLogicalBackupJob(t *testing.T) {
 	}
 }
 
-// blockLifecycleUpdate lives in cluster.go but is exercised here because the
+// shouldBlockLifecycleUpdate lives in cluster.go but is exercised here because the
 // lifecycle subsystem owns its semantics (Stopped/Stopping states).
-func TestBlockLifecycleUpdate(t *testing.T) {
+func TestShouldBlockLifecycleUpdate(t *testing.T) {
 	tests := []struct {
 		name           string
 		currentStatus  string
@@ -981,7 +981,7 @@ func TestBlockLifecycleUpdate(t *testing.T) {
 				newSpec.Spec.Lifecycle = &acidv1.LifecycleSpec{Phase: tt.lifecyclePhase}
 			}
 
-			blocked, err := c.blockLifecycleUpdate(newSpec)
+			blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 
 			if tt.wantErr {
 				assert.Error(t, err)
@@ -1001,7 +1001,7 @@ func TestLifecycleUpdateBlocksDuringStopping(t *testing.T) {
 	c := newLifecycleCluster(client, acidv1.ClusterStatusStopping, 0, acidv1.LifecyclePhaseStopped, 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
+	blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 
 	assert.True(t, blocked)
 	assert.Error(t, err)
@@ -1013,7 +1013,7 @@ func TestLifecycleUpdateBlocksWhenStoppedWithPhase(t *testing.T) {
 	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, acidv1.LifecyclePhaseStopped, 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
+	blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 
 	assert.True(t, blocked)
 	assert.Error(t, err)
@@ -1025,7 +1025,7 @@ func TestLifecycleUpdateAllowsWakeUp(t *testing.T) {
 	c := newLifecycleCluster(client, acidv1.ClusterStatusStopped, 0, "", 3, nil)
 
 	newSpec := c.Postgresql.DeepCopy()
-	blocked, err := c.blockLifecycleUpdate(newSpec)
+	blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 
 	assert.False(t, blocked)
 	assert.NoError(t, err)

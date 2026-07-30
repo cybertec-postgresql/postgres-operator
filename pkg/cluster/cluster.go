@@ -1009,7 +1009,7 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	defer c.mu.Unlock()
 
 	// Block all spec changes when cluster is stopped or stopping
-	blocked, err := c.blockLifecycleUpdate(newSpec)
+	blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 	if err != nil {
 		return err
 	}
@@ -1051,7 +1051,7 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	// When isLifecycleActive, the watch delivered newSpec with a status from
 	// BEFORE our latest status write (e.g. status=Updating while c.Status is
 	// already Running). Clobbering c.Status with the stale value would break
-	// the next Update's blockLifecycleUpdate check — preserve the authoritative
+	// the next Update's shouldBlockLifecycleUpdate check — preserve the authoritative
 	// c.Status, only refresh the spec fields.
 	if !isLifecycleActive {
 		c.setSpec(newSpec)
@@ -1270,12 +1270,12 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	return nil
 }
 
-// blockLifecycleUpdate checks if an update should be blocked due to lifecycle state.
+// shouldBlockLifecycleUpdate checks if an update should be blocked due to lifecycle state.
 // Returns (blocked bool, err error):
 //   - (true, nil) if update is blocked and caller should return early
 //   - (false, nil) if update can proceed
 //   - (false, error) on error
-func (c *Cluster) blockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error) {
+func (c *Cluster) shouldBlockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error) {
 	if !c.Status.Stopped() && !c.Status.Stopping() {
 		return false, nil
 	}

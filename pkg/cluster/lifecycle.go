@@ -17,10 +17,9 @@ import (
 type LifecycleAction int
 
 const (
-	LifecycleActionNone              LifecycleAction = iota
-	LifecycleActionHibernate                         // Running -> Stopping (initiate hibernate)
-	LifecycleActionStoppingCompleted                 // Stopping -> Stopped (pods fully terminated)
-	LifecycleActionWakeUp                            // Stopped -> Updating (initiate wake-up)
+	LifecycleActionNone      LifecycleAction = iota
+	LifecycleActionHibernate                 // Running -> Stopping (initiate hibernate)
+	LifecycleActionWakeUp                    // Stopped -> Updating (initiate wake-up)
 )
 
 // detectLifecycleTransition is a pure function that examines the current and proposed specs

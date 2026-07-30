@@ -825,8 +825,6 @@ func (c *Cluster) deleteLogicalBackupJob() error {
 	return nil
 }
 
-
-
 // GetServiceMaster returns cluster's kubernetes master Service
 func (c *Cluster) GetServiceMaster() *v1.Service {
 	return c.Services[Master]

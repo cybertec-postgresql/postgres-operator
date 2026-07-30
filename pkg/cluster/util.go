@@ -476,7 +476,7 @@ func (c *Cluster) waitStatefulsetPodsReady() error {
 // On timeout, returns an error so callers can surface it to the controller.
 func (c *Cluster) waitStatefulsetPodsGone() error {
 	c.setProcessName("waiting for statefulset pods to terminate")
-	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
+	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.PodTerminateGracePeriod,
 		func() (bool, error) {
 			sts, err := c.KubeClient.StatefulSets(c.Namespace).Get(
 				context.TODO(), c.statefulSetName(), metav1.GetOptions{})
