@@ -1008,20 +1008,70 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
-
-	newSpec, err := c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
+	// Block all spec changes when cluster is stopped or stopping
+	blocked, err := c.shouldBlockLifecycleUpdate(newSpec)
 	if err != nil {
-		return fmt.Errorf("could not set cluster status to updating: %w", err)
+		return err
+	}
+	if blocked {
+		return nil
+	}
+
+	// Handle lifecycle transitions (hibernate/wake-up)
+	handled, err := c.handleHibernateAndWakeUp(newSpec)
+	if err != nil {
+		return err
+	}
+	if handled {
+		return nil
+	}
+
+	// If a previous Update already set a lifecycle status do not clobber it.
+	// The watch event that triggered this Update is a follow-up from the operator's
+	// write, so the status subresource is already at the correct value, and writing again
+	// would cause a 409 Conflict.
+	isLifecycleActive := newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusUpdating ||
+		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopping ||
+		newSpec.Status.PostgresClusterStatus == acidv1.ClusterStatusStopped
+
+	if !isLifecycleActive {
+		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
+
+		newSpec, err = c.KubeClient.SetPostgresCRDStatus(c.clusterName(), newSpec)
+		if err != nil {
+			return fmt.Errorf("could not set cluster status to updating: %w", err)
+		}
 	}
 
 	if !c.isInMaintenanceWindow(newSpec.Spec.MaintenanceWindows) {
 		// do not apply any major version related changes yet
 		newSpec.Spec.PostgresqlParam.PgVersion = oldSpec.Spec.PostgresqlParam.PgVersion
 	}
-	c.setSpec(newSpec)
+
+	// When isLifecycleActive, the watch delivered newSpec with a status from
+	// BEFORE our latest status write (e.g. status=Updating while c.Status is
+	// already Running). Clobbering c.Status with the stale value would break
+	// the next Update's shouldBlockLifecycleUpdate check — preserve the authoritative
+	// c.Status, only refresh the spec fields.
+	if !isLifecycleActive {
+		c.setSpec(newSpec)
+	} else {
+		cached, _ := c.GetSpec()
+		// Watch delivered newSpec with a stale lifecycle Status (e.g. Updating
+		// while c.Status is already Running). Preserve the authoritative
+		// c.Status; take ObjectMeta, Spec, and TypeMeta from newSpec so user
+		// edits to labels, annotations, finalizers, etc. made during an
+		// in-flight lifecycle aren't silently dropped.
+		merged := newSpec.DeepCopy()
+		merged.Status = cached.Status
+		c.setSpec(merged)
+	}
 
 	defer func() {
+		if isLifecycleActive {
+			// Status was set by a previous Update; sync's defer will take care
+			return
+		}
 		currentStatus := newSpec.Status.DeepCopy()
 		newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusRunning
 
@@ -1218,6 +1268,34 @@ func (c *Cluster) Update(oldSpec, newSpec *acidv1.Postgresql) error {
 	}
 
 	return nil
+}
+
+// shouldBlockLifecycleUpdate checks if an update should be blocked due to lifecycle state.
+// Returns (blocked bool, err error):
+//   - (true, nil) if update is blocked and caller should return early
+//   - (false, nil) if update can proceed
+//   - (false, error) on error
+func (c *Cluster) shouldBlockLifecycleUpdate(newSpec *acidv1.Postgresql) (bool, error) {
+	if !c.Status.Stopped() && !c.Status.Stopping() {
+		return false, nil
+	}
+
+	var lifecyclePhase acidv1.LifecyclePhase
+	if newSpec.Spec.Lifecycle != nil {
+		lifecyclePhase = newSpec.Spec.Lifecycle.Phase
+	}
+
+	// During Stopping: block ALL spec changes (no cancellation allowed)
+	if c.Status.Stopping() {
+		return true, fmt.Errorf("cannot update cluster while it is stopping. Wait for it to fully stop first")
+	}
+
+	// During Stopped: only block if keeping lifecycle.phase="stopped"
+	if lifecyclePhase == acidv1.LifecyclePhaseStopped {
+		return true, fmt.Errorf("cannot update cluster while stopped. Remove lifecycle.phase or set it to an empty string to wake up the cluster")
+	}
+
+	return false, nil
 }
 
 func syncResources(a, b *v1.ResourceRequirements) bool {

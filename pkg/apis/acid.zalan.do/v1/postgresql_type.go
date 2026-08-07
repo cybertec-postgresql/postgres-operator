@@ -115,6 +115,7 @@ type PostgresSpec struct {
 	TLS                       *TLSDescription    `json:"tls,omitempty"`
 	AdditionalVolumes         []AdditionalVolume `json:"additionalVolumes,omitempty"`
 	Streams                   []Stream           `json:"streams,omitempty"`
+	Lifecycle                 *LifecycleSpec     `json:"lifecycle,omitempty"`
 	Env                       []v1.EnvVar        `json:"env,omitempty"`
 
 	// deprecated
@@ -257,6 +258,12 @@ type StandbyDescription struct {
 	StandbyPrimarySlotName string `json:"standby_primary_slot_name,omitempty"`
 }
 
+// LifecycleSpec describes the lifecycle state of a Postgres cluster.
+type LifecycleSpec struct {
+	// +kubebuilder:validation:Enum="";stopped
+	Phase LifecyclePhase `json:"phase,omitempty"`
+}
+
 // TLSDescription specs TLS properties
 type TLSDescription struct {
 	// +required
@@ -302,7 +309,9 @@ type UserFlags []string
 
 // PostgresStatus contains status of the PostgreSQL cluster (running, creation failed etc.)
 type PostgresStatus struct {
-	PostgresClusterStatus string `json:"PostgresClusterStatus"`
+	PostgresClusterStatus     string           `json:"PostgresClusterStatus"`
+	PreviousNumberOfInstances int32            `json:"previousNumberOfInstances,omitempty"`
+	PreviousPoolerInstances   map[string]int32 `json:"previousPoolerInstances,omitempty"`
 }
 
 // ConnectionPooler Options for connection pooler
