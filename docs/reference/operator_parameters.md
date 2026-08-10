@@ -397,7 +397,8 @@ configuration they are grouped under the `kubernetes` key.
   Postgresql resource acts as a controller owner. To prevent that, the
   operator skips the controller owner reference on user-credential secrets
   whenever `enable_secrets_deletion` is `false`, so the two settings work
-  together. The default is `true`.
+  together. This protection takes effect on the cluster's next sync after
+  the setting is applied. The default is `true`.
 
 * **enable_persistent_volume_claim_deletion**
   By default, the operator deletes persistent volume claims when removing the
