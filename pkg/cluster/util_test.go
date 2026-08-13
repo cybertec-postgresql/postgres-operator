@@ -617,6 +617,119 @@ func TestInheritedAnnotations(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// newLifecycleActiveTestCluster constructs a minimal Cluster suitable for
+// exercising the isLifecycleActive branch of Update. It only wires up the
+// kube/CR getters used to reach that branch; downstream sync calls panic
+// because the fake clientset has no resources, which is fine — the buggy
+// branch executes before the panic and callers wrap the call in a closure
+// with defer recover() to keep observing c.Postgresql afterwards.
+func newLifecycleActiveTestCluster() *Cluster {
+	clientSet := k8sFake.NewSimpleClientset()
+	acidClientSet := fakeacidv1.NewSimpleClientset()
+
+	client := k8sutil.KubernetesClient{
+		ConfigMapsGetter:  clientSet.CoreV1(),
+		PostgresqlsGetter: acidClientSet.AcidV1(),
+	}
+
+	pg := acidv1.Postgresql{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-cluster",
+			Namespace: "default",
+		},
+	}
+
+	return New(
+		Config{
+			OpConfig: config.Config{
+				PodManagementPolicy: "ordered_ready",
+			},
+		}, client, pg, logger, eventRecorder)
+}
+
+// TestUpdate_PreservesAnnotationsInLifecycleActiveBranch guards against a
+// regression introduced in SCF-830 where the operator's internal cluster spec
+// was rebuilt from a cached copy that did not include the new
+// ObjectMeta.Annotations carried by the watch event.
+//
+// When a watch event arrives with newSpec.Status.PostgresClusterStatus set to
+// Updating/Stopping/Stopped (i.e. isLifecycleActive), the operator takes the
+// branch at cluster.go:1058-1062 to avoid clobbering c.Status with a stale
+// watch-delivered value. That branch must still take the watch's
+// ObjectMeta, Spec, and TypeMeta — otherwise a user patch that adds or removes
+// an annotation (e.g. the major-version-upgrade-failure annotation set by the
+// operator on a failed v16->v18 upgrade) silently disappears from the
+// operator's view of the cluster, and the next reconciliation proceeds as if
+// the annotation was never set.
+//
+// Regression context: E2E test_major_version_upgrade failed on the GitHub
+// runner with `18 != 16` — the failure annotation applied during the v16->v18
+// attempt was ignored because the operator's in-memory spec had been rebuilt
+// from a cached copy that pre-dated the annotation patch.
+func TestUpdate_PreservesAnnotationsInLifecycleActiveBranch(t *testing.T) {
+	cluster := newLifecycleActiveTestCluster()
+
+	oldSpec := cluster.Postgresql.DeepCopy()
+
+	newSpec := cluster.Postgresql.DeepCopy()
+	newSpec.ObjectMeta.Annotations = map[string]string{
+		majorVersionUpgradeFailureAnnotation: "v16->v18 failed",
+	}
+	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
+
+	// The isLifecycleActive branch (which dropped newSpec.ObjectMeta before
+	// the fix) executes at cluster.go:1058-1062, well before the downstream
+	// sync calls that panic without a fully-populated fake clientset. Wrap
+	// the call in a closure so the recover() runs to completion, then the
+	// assertion observes c.Postgresql.ObjectMeta.Annotations — set by the
+	// branch under test — without the panic short-circuiting it.
+	func() {
+		defer func() { _ = recover() }()
+		_ = cluster.Update(oldSpec, newSpec)
+	}()
+
+	got, ok := cluster.Postgresql.ObjectMeta.Annotations[majorVersionUpgradeFailureAnnotation]
+	if !ok {
+		t.Fatalf("annotation %q was dropped by the isLifecycleActive branch in Update; "+
+			"c.Postgresql.ObjectMeta.Annotations = %v",
+			majorVersionUpgradeFailureAnnotation, cluster.Postgresql.ObjectMeta.Annotations)
+	}
+	if got != "v16->v18 failed" {
+		t.Errorf("annotation %q = %q, want %q",
+			majorVersionUpgradeFailureAnnotation, got, "v16->v18 failed")
+	}
+}
+
+// TestUpdate_PreservesLabelsInLifecycleActiveBranch extends the previous
+// regression test to ObjectMeta.Labels. The same fix that preserves
+// annotations should also preserve label edits made during an in-flight
+// lifecycle — a label-only patch would otherwise be silently dropped by the
+// same buggy branch.
+func TestUpdate_PreservesLabelsInLifecycleActiveBranch(t *testing.T) {
+	cluster := newLifecycleActiveTestCluster()
+
+	oldSpec := cluster.Postgresql.DeepCopy()
+
+	newSpec := cluster.Postgresql.DeepCopy()
+	newSpec.ObjectMeta.Labels = map[string]string{"team": "platform"}
+	newSpec.Status.PostgresClusterStatus = acidv1.ClusterStatusUpdating
+
+	func() {
+		defer func() { _ = recover() }()
+		_ = cluster.Update(oldSpec, newSpec)
+	}()
+
+	got, ok := cluster.Postgresql.ObjectMeta.Labels["team"]
+	if !ok {
+		t.Fatalf("label %q was dropped by the isLifecycleActive branch in Update; "+
+			"c.Postgresql.ObjectMeta.Labels = %v",
+			"team", cluster.Postgresql.ObjectMeta.Labels)
+	}
+	if got != "platform" {
+		t.Errorf("label %q = %q, want %q", "team", got, "platform")
+	}
+}
+
 func Test_trimCronjobName(t *testing.T) {
 	type args struct {
 		name string

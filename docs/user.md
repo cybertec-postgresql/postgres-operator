@@ -905,6 +905,146 @@ original UID, making it possible retry restoring. However, it is probably
 better to create a temporary clone for experimenting or finding out to which
 point you should restore.
 
+## Automated Restore in place (Point-in-Time Recovery)
+
+The operator supports automated in-place restores, allowing you to restore a database to a specific point in time without changing connection strings on the application side. This feature orchestrates the deletion of the current cluster and the creation of a new one from a backup.
+
+:warning: This is a destructive operation. The existing cluster's StatefulSet and pods will be deleted as part of the process. Ensure you have a reliable backup strategy and have tested the restore process in a non-production environment.
+
+To trigger an in-place restore, you need to add a special annotation and a `clone` section to your `postgresql` manifest:
+
+*   **Annotate the manifest**: Add the `postgres-operator.zalando.org/action: restore-in-place` annotation to the `metadata` section.
+*   **Specify the recovery target**: Add a `clone` section to the `spec`, providing the `cluster` name and the `timestamp` for the point-in-time recovery. The `cluster` name **must** be the same as the `metadata.name` of the cluster you are restoring. The `timestamp` must be in RFC 3339 format and point to a time in the past for which you have WAL archives.
+
+Here is an example manifest snippet:
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-minimal-cluster
+  annotations:
+    postgres-operator.zalando.org/action: restore-in-place
+spec:
+  # ... other cluster parameters
+  clone:
+    cluster: "acid-minimal-cluster" # Must match metadata.name
+    uid: "<original_UID>"
+    timestamp: "2022-04-01T10:11:12+00:00"
+  # ... other cluster parameters
+```
+
+When you apply this manifest, the operator will:
+*   See the `restore-in-place` annotation and begin the restore workflow.
+*   Store the restore request and the new cluster definition in a temporary `ConfigMap`.
+*   Delete the existing `postgresql` custom resource, which triggers the deletion of the associated StatefulSet and pods.
+*   Wait for the old cluster to be fully terminated.
+*   Create a new `postgresql` resource with a new UID but the same name.
+*   The new cluster will bootstrap from the latest base backup prior to the given `timestamp` and replay WAL files to recover to the specified point in time.
+
+The process is asynchronous. You can monitor the operator logs and the state of the `postgresql` resource to follow the progress. Once the new cluster is up and running, your applications can reconnect.
+
+## Hibernate and Wake-up a Cluster
+
+The operator supports hibernating a PostgreSQL cluster to save resources when it's
+not needed, and waking it up again when required. This feature:
+
+* Scales down the PostgreSQL StatefulSet to 0 replicas (stops all pods)
+* Scales down the connection pooler to 0 replicas
+* Preserves the cluster configuration and data (PVCs are retained)
+* Stores the previous replica counts for automatic restoration
+
+### Initiating Hibernate
+
+To hibernate a running cluster, set the `lifecycle.phase` field to `"stopped"`:
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-test-cluster
+spec:
+  teamId: "test-team"
+  # ... other cluster parameters
+  numberOfInstances: 3
+  lifecycle:
+    phase: "stopped"
+```
+
+When you apply this manifest, the operator will:
+
+* Store the current `numberOfInstances` in `status.previousNumberOfInstances`
+* Store the connection pooler replica counts in `status.previousPoolerInstances`
+* Set `spec.numberOfInstances` to 0
+* Scale down the StatefulSet to 0 replicas
+* Scale down the connection pooler deployments to 0 replicas
+* Suspend the logical backup CronJob (if enabled)
+* Set `status.PostgresClusterStatus` to "Stopping", then "Stopped"
+
+### Waking up a Cluster
+
+To wake up a hibernated cluster, remove the `lifecycle.phase` field or set it to
+an empty value:
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-test-cluster
+spec:
+  teamId: "test-team"
+  # ... other cluster parameters
+  # lifecycle.phase is not set or is removed
+```
+
+When you apply this manifest, the operator will:
+
+* Restore `numberOfInstances` from `status.previousNumberOfInstances`
+* Restore the connection pooler replica counts from `status.previousPoolerInstances`
+* Resume the logical backup CronJob (if enabled)
+* Scale up the StatefulSet to the previous replica count
+* Scale up the connection pooler deployments to the previous replica counts
+* Set `status.PostgresClusterStatus` to "Updating", then "Running"
+* Clear `status.previousNumberOfInstances` and `status.previousPoolerInstances`
+
+### Cluster Status During Lifecycle Transitions
+
+| Status | Meaning |
+|--------|---------|
+| Running | Cluster is running normally |
+| Stopping | Cluster is transitioning to stopped state (pods terminating) |
+| Stopped | All pods have been terminated, cluster is hibernated |
+
+### Restrictions During Hibernate
+
+* **During Stopping**: All spec changes are blocked. You must wait for the cluster
+  to reach the Stopped state before making changes.
+
+* **During Stopped**: Spec changes are blocked unless you remove `lifecycle.phase`
+  to wake up the cluster. This prevents accidental modifications to a hibernated
+  cluster.
+
+### Connection Pooler Behavior
+
+The connection pooler is automatically scaled alongside the cluster:
+
+* When the cluster hibernates, the pooler is scaled to 0 replicas
+* When the cluster wakes up, the pooler is restored to its previous replica count
+* The previous replica counts are stored in `status.previousPoolerInstances`
+
+Note: If the connection pooler was already at 0 replicas before hibernate, it
+will remain at 0 after wake-up.
+
+### Logical Backup Behavior
+
+The logical backup CronJob is automatically suspended during hibernate:
+
+* When the cluster hibernates, the backup CronJob is suspended (`.spec.suspend: true`)
+* When the cluster wakes up, the backup CronJob is automatically resumed
+* The backup schedule is preserved and resumes from its normal schedule
+
+This prevents failed backup jobs from running when the database is unavailable.
+
 ## Setting up a standby cluster
 
 Standby cluster is a [Patroni feature](https://github.com/zalando/patroni/blob/master/docs/replica_bootstrap.rst#standby-cluster)
@@ -1316,3 +1456,4 @@ As of now, the operator does not sync the pooler deployment automatically
 which means that changes in the pod template are not caught. You need to
 toggle `enableConnectionPooler` to set environment variables, volumes, secret
 mounts and securityContext required for TLS support in the pooler pod.
+

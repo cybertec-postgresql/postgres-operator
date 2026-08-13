@@ -460,6 +460,8 @@ type OperatorConfigurationData struct {
 	ConnectionPooler ConnectionPoolerConfiguration `json:"connection_pooler"`
 	// +optional
 	Patroni PatroniConfiguration `json:"patroni"`
+	// +optional
+	PitrBackupRetention *metav1.Duration `json:"pitr_backup_retention,omitempty"`
 
 	// +kubebuilder:validation:Minimum=-1
 	// +kubebuilder:default=-1

@@ -21,6 +21,7 @@ pipelines with no access to Kubernetes API directly, promoting infrastructure as
 * Restore and cloning Postgres clusters on AWS, GCS and Azure
 * Additionally logical backups to S3 or GCS bucket can be configured
 * Standby cluster from S3 or GCS WAL archive or remote host
+* Hibernate and wake-up of Postgres clusters (scale StatefulSet and pooler to 0 while preserving data, then restore)
 * Configurable for non-cloud environments
 * Basic credential and user management on K8s, eases application deployments
 * Support for custom TLS certificates

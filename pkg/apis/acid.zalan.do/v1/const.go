@@ -9,6 +9,8 @@ const (
 	ClusterStatusSyncFailed   = "SyncFailed"
 	ClusterStatusAddFailed    = "CreateFailed"
 	ClusterStatusRunning      = "Running"
+	ClusterStatusStopping     = "Stopping"
+	ClusterStatusStopped      = "Stopped"
 	ClusterStatusInvalid      = "Invalid"
 )
 
@@ -16,4 +18,12 @@ const (
 	serviceNameMaxLength   = 63
 	clusterNameMaxLength   = serviceNameMaxLength - len("-repl")
 	serviceNameRegexString = `^[a-z]([-a-z0-9]*[a-z0-9])?$`
+)
+
+// LifecyclePhase describes the desired lifecycle state of a Postgres cluster.
+type LifecyclePhase string
+
+const (
+	// LifecyclePhaseStopped scales the cluster down to 0 replicas.
+	LifecyclePhaseStopped LifecyclePhase = "stopped"
 )

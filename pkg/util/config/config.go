@@ -2,9 +2,8 @@ package config
 
 import (
 	"encoding/json"
-	"strings"
-
 	"fmt"
+	"strings"
 
 	"github.com/zalando/postgres-operator/pkg/spec"
 	"github.com/zalando/postgres-operator/pkg/util/constants"
@@ -18,6 +17,7 @@ type CRD struct {
 	ReadyWaitTimeout      *metav1.Duration `name:"ready_wait_timeout" default:"30s"`
 	ResyncPeriod          *metav1.Duration `name:"resync_period" default:"30m"`
 	RepairPeriod          *metav1.Duration `name:"repair_period" default:"5m"`
+	PitrBackupRetention   *metav1.Duration `name:"pitr_backup_retention" default:"168h"`
 	EnableCRDRegistration *bool            `name:"enable_crd_registration" default:"true"`
 	CRDCategories         []string         `name:"crd_categories" default:"all"`
 }

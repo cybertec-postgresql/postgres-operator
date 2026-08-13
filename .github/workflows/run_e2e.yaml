@@ -1,6 +1,7 @@
 name: operator-e2e-tests
 
-on: 
+on:
+  workflow_call:
   pull_request:
   push:
     branches:

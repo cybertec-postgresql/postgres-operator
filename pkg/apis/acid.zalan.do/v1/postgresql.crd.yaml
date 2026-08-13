@@ -2174,6 +2174,18 @@ spec:
                     format: int32
                     type: integer
                 type: object
+              lifecycle:
+                description: LifecycleSpec describes the lifecycle state of a Postgres
+                  cluster.
+                properties:
+                  phase:
+                    description: LifecyclePhase describes the desired lifecycle state
+                      of a Postgres cluster.
+                    enum:
+                    - ""
+                    - stopped
+                    type: string
+                type: object
               logicalBackupRetention:
                 type: string
               logicalBackupSchedule:
@@ -3340,6 +3352,14 @@ spec:
             properties:
               PostgresClusterStatus:
                 type: string
+              previousNumberOfInstances:
+                format: int32
+                type: integer
+              previousPoolerInstances:
+                type: object
+                additionalProperties:
+                  format: int32
+                  type: integer
             required:
             - PostgresClusterStatus
             type: object

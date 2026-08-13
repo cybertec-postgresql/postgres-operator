@@ -51,10 +51,14 @@ var clusterNames = []struct {
 	{"common team and cluster name", "acid-test", "acid", "test", nil},
 	{"cluster name with hyphen", "test-my-name", "test", "my-name", nil},
 	{"cluster and team name with hyphen", "my-team-another-test", "my-team", "another-test", nil},
-	{"expect error as cluster name is just hyphens", "------strange-team-cluster", "-----", "strange-team-cluster",
-		errors.New(`name must confirm to DNS-1035, regex used for validation is "^[a-z]([-a-z0-9]*[a-z0-9])?$"`)},
-	{"expect error as cluster name is too long", "fooobar-fooobarfooobarfooobarfooobarfooobarfooobarfooobarfooobar", "fooobar", "",
-		errors.New("name cannot be longer than 58 characters")},
+	{
+		"expect error as cluster name is just hyphens", "------strange-team-cluster", "-----", "strange-team-cluster",
+		errors.New(`name must confirm to DNS-1035, regex used for validation is "^[a-z]([-a-z0-9]*[a-z0-9])?$"`),
+	},
+	{
+		"expect error as cluster name is too long", "fooobar-fooobarfooobarfooobarfooobarfooobarfooobarfooobarfooobar", "fooobar", "",
+		errors.New("name cannot be longer than 58 characters"),
+	},
 	{"expect error as cluster name does not match {TEAM}-{NAME} format", "acid-test", "test", "", errors.New("name must match {TEAM}-{NAME} format")},
 	{"expect error as team and cluster name are empty", "-test", "", "", errors.New("team name is empty")},
 	{"expect error as cluster name is empty and team name is a hyphen", "-test", "-", "", errors.New("name must match {TEAM}-{NAME} format")},
@@ -71,10 +75,14 @@ var cloneClusterDescriptions = []struct {
 	err   error
 }{
 	{"cluster name invalid but EndTimeSet is not empty", &CloneDescription{"foo+bar", "", "NotEmpty", "", "", "", "", nil}, nil},
-	{"expect error as cluster name does not match DNS-1035", &CloneDescription{"foo+bar", "", "", "", "", "", "", nil},
-		errors.New(`clone cluster name must confirm to DNS-1035, regex used for validation is "^[a-z]([-a-z0-9]*[a-z0-9])?$"`)},
-	{"expect error as cluster name is too long", &CloneDescription{"foobar123456789012345678901234567890123456789012345678901234567890", "", "", "", "", "", "", nil},
-		errors.New("clone cluster name must be no longer than 63 characters")},
+	{
+		"expect error as cluster name does not match DNS-1035", &CloneDescription{"foo+bar", "", "", "", "", "", "", nil},
+		errors.New(`clone cluster name must confirm to DNS-1035, regex used for validation is "^[a-z]([-a-z0-9]*[a-z0-9])?$"`),
+	},
+	{
+		"expect error as cluster name is too long", &CloneDescription{"foobar123456789012345678901234567890123456789012345678901234567890", "", "", "", "", "", "", nil},
+		errors.New("clone cluster name must be no longer than 63 characters"),
+	},
 	{"common cluster name", &CloneDescription{"foobar", "", "", "", "", "", "", nil}, nil},
 }
 
@@ -83,45 +91,61 @@ var maintenanceWindows = []struct {
 	in    []byte
 	out   MaintenanceWindow
 	err   error
-}{{"regular scenario",
-	[]byte(`"Tue:10:00-20:00"`),
-	MaintenanceWindow{
-		Everyday:  false,
-		Weekday:   time.Tuesday,
-		StartTime: mustParseTime("10:00"),
-		EndTime:   mustParseTime("20:00"),
-	}, nil},
-	{"regular every day scenario",
+}{
+	{
+		"regular scenario",
+		[]byte(`"Tue:10:00-20:00"`),
+		MaintenanceWindow{
+			Everyday:  false,
+			Weekday:   time.Tuesday,
+			StartTime: mustParseTime("10:00"),
+			EndTime:   mustParseTime("20:00"),
+		},
+		nil,
+	},
+	{
+		"regular every day scenario",
 		[]byte(`"05:00-07:00"`),
 		MaintenanceWindow{
 			Everyday:  true,
 			StartTime: mustParseTime("05:00"),
 			EndTime:   mustParseTime("07:00"),
-		}, nil},
-	{"starts and ends at the same time",
+		},
+		nil,
+	},
+	{
+		"starts and ends at the same time",
 		[]byte(`"Mon:10:00-10:00"`),
 		MaintenanceWindow{
 			Everyday:  false,
 			Weekday:   time.Monday,
 			StartTime: mustParseTime("10:00"),
 			EndTime:   mustParseTime("10:00"),
-		}, nil},
-	{"starts and ends 00:00 on sunday",
+		},
+		nil,
+	},
+	{
+		"starts and ends 00:00 on sunday",
 		[]byte(`"Sun:00:00-00:00"`),
 		MaintenanceWindow{
 			Everyday:  false,
 			Weekday:   time.Sunday,
 			StartTime: mustParseTime("00:00"),
 			EndTime:   mustParseTime("00:00"),
-		}, nil},
-	{"without day indication should define to sunday",
+		},
+		nil,
+	},
+	{
+		"without day indication should define to sunday",
 		[]byte(`"01:00-10:00"`),
 		MaintenanceWindow{
 			Everyday:  true,
 			Weekday:   time.Sunday,
 			StartTime: mustParseTime("01:00"),
 			EndTime:   mustParseTime("10:00"),
-		}, nil},
+		},
+		nil,
+	},
 	{"expect error as 'From' is later than 'To'", []byte(`"Mon:12:00-11:00"`), MaintenanceWindow{}, errors.New(`'From' time must be prior to the 'To' time`)},
 	{"expect error as 'From' is later than 'To' with 00:00 corner case", []byte(`"Mon:10:00-00:00"`), MaintenanceWindow{}, errors.New(`'From' time must be prior to the 'To' time`)},
 	{"expect error as 'From' time is not valid", []byte(`"Wed:33:00-00:00"`), MaintenanceWindow{}, errors.New(`could not parse start time: parsing time "33:00": hour out of range`)},
@@ -132,7 +156,8 @@ var maintenanceWindows = []struct {
 	{"expect error as 'To' time set seconds", []byte(`"Mon:00:00-00:00:00"`), MaintenanceWindow{}, errors.New("could not parse end time: incorrect time format")},
 	// ideally, should be implemented
 	{"expect error as 'To' has a weekday", []byte(`"Mon:00:00-Fri:00:00"`), MaintenanceWindow{}, errors.New("could not parse end time: incorrect time format")},
-	{"expect error as 'To' time is missing", []byte(`"Mon:00:00"`), MaintenanceWindow{}, errors.New("incorrect maintenance window format")}}
+	{"expect error as 'To' time is missing", []byte(`"Mon:00:00"`), MaintenanceWindow{}, errors.New("incorrect maintenance window format")},
+}
 
 var postgresStatus = []struct {
 	about string
@@ -140,125 +165,217 @@ var postgresStatus = []struct {
 	out   PostgresStatus
 	err   error
 }{
-	{"cluster running", []byte(`{"PostgresClusterStatus":"Running"}`),
-		PostgresStatus{PostgresClusterStatus: ClusterStatusRunning}, nil},
-	{"cluster status undefined", []byte(`{"PostgresClusterStatus":""}`),
-		PostgresStatus{PostgresClusterStatus: ClusterStatusUnknown}, nil},
-	{"cluster running without full JSON format", []byte(`"Running"`),
-		PostgresStatus{PostgresClusterStatus: ClusterStatusRunning}, nil},
-	{"cluster status empty", []byte(`""`),
-		PostgresStatus{PostgresClusterStatus: ClusterStatusUnknown}, nil}}
+	{
+		"cluster running", []byte(`{"PostgresClusterStatus":"Running"}`),
+		PostgresStatus{PostgresClusterStatus: ClusterStatusRunning},
+		nil,
+	},
+	{
+		"cluster status undefined", []byte(`{"PostgresClusterStatus":""}`),
+		PostgresStatus{PostgresClusterStatus: ClusterStatusUnknown},
+		nil,
+	},
+	{
+		"cluster running without full JSON format", []byte(`"Running"`),
+		PostgresStatus{PostgresClusterStatus: ClusterStatusRunning},
+		nil,
+	},
+	{
+		"cluster status empty", []byte(`""`),
+		PostgresStatus{PostgresClusterStatus: ClusterStatusUnknown},
+		nil,
+	},
+}
 
-var tmp postgresqlCopy
-var unmarshalCluster = []struct {
+var lifecyclePhases = []struct {
+	about string
+	in    LifecyclePhase
+	out   bool
+}{
+	{"empty phase is not stopped", "", false},
+	{"stopped phase is stopped", LifecyclePhaseStopped, true},
+	{"unknown phase is not stopped", LifecyclePhase("running"), false},
+	{"stopped with different casing is not stopped", LifecyclePhase("STOPPED"), false},
+}
+
+var lifecycleSpecJSON = []struct {
 	about   string
 	in      []byte
-	out     Postgresql
+	out     LifecycleSpec
 	marshal []byte
 	err     error
 }{
 	{
-		about: "example with simple status field",
-		in: []byte(`{
-	  "kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
-	  "metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`),
-		out: Postgresql{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Postgresql",
-				APIVersion: "acid.zalan.do/v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "acid-testcluster1",
-			},
-			Status: PostgresStatus{PostgresClusterStatus: ClusterStatusInvalid},
-			// This error message can vary between Go versions, so compute it for the current version.
-			Error: json.Unmarshal([]byte(`{
-				"kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
-				"metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`), &tmp).Error(),
-		},
-		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":"Invalid"}`),
+		about:   "phase stopped unmarshals correctly",
+		in:      []byte(`{"phase":"stopped"}`),
+		out:     LifecycleSpec{Phase: LifecyclePhaseStopped},
+		marshal: []byte(`{"phase":"stopped"}`),
 		err:     nil,
 	},
 	{
-		about: "example with /status subresource",
-		in: []byte(`{
-	  "kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
-	  "metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`),
-		out: Postgresql{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Postgresql",
-				APIVersion: "acid.zalan.do/v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "acid-testcluster1",
-			},
-			Status: PostgresStatus{PostgresClusterStatus: ClusterStatusInvalid},
-			// This error message can vary between Go versions, so compute it for the current version.
-			Error: json.Unmarshal([]byte(`{
-				"kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
-				"metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`), &tmp).Error(),
-		},
-		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":{"PostgresClusterStatus":"Invalid"}}`),
+		about:   "empty phase unmarshals correctly",
+		in:      []byte(`{"phase":""}`),
+		out:     LifecycleSpec{Phase: ""},
+		marshal: []byte(`{}`),
 		err:     nil,
-	},
-	{
-		about: "example with clone",
-		in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "clone": {"cluster": "team-batman"}}}`),
-		out: Postgresql{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Postgresql",
-				APIVersion: "acid.zalan.do/v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "acid-testcluster1",
-			},
-			Spec: PostgresSpec{
-				TeamID: "acid",
-				Clone: &CloneDescription{
-					ClusterName: "team-batman",
-				},
-			},
-			Error: "",
-		},
-		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":{"cluster":"team-batman"}},"status":{"PostgresClusterStatus":""}}`),
-		err:     nil,
-	},
-	{
-		about: "standby example",
-		in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "standby": {"s3_wal_path": "s3://custom/path/to/bucket/"}}}`),
-		out: Postgresql{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "Postgresql",
-				APIVersion: "acid.zalan.do/v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name: "acid-testcluster1",
-			},
-			Spec: PostgresSpec{
-				TeamID: "acid",
-				StandbyCluster: &StandbyDescription{
-					S3WalPath: "s3://custom/path/to/bucket/",
-				},
-			},
-			Error: "",
-		},
-		marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"standby":{"s3_wal_path":"s3://custom/path/to/bucket/"}},"status":{"PostgresClusterStatus":""}}`),
-		err:     nil,
-	},
-	{
-		about:   "expect error on malformatted JSON",
-		in:      []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1"`),
-		out:     Postgresql{},
-		marshal: []byte{},
-		err:     errors.New("unexpected end of JSON input")},
-	{
-		about:   "expect error on JSON with field's value malformatted",
-		in:      []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster","creationTimestamp":qaz},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"resources":{"requests":{"cpu":"","memory":""},"limits":{"cpu":"","memory":""}},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":{"PostgresClusterStatus":"Invalid"}}`),
-		out:     Postgresql{},
-		marshal: []byte{},
-		err:     errors.New("invalid character 'q' looking for beginning of value"),
 	},
 }
+
+var (
+	tmp              postgresqlCopy
+	unmarshalCluster = []struct {
+		about   string
+		in      []byte
+		out     Postgresql
+		marshal []byte
+		err     error
+	}{
+		{
+			about: "example with simple status field",
+			in: []byte(`{
+	  "kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
+	  "metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Status: PostgresStatus{PostgresClusterStatus: ClusterStatusInvalid},
+				// This error message can vary between Go versions, so compute it for the current version.
+				Error: json.Unmarshal([]byte(`{
+				"kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
+				"metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`), &tmp).Error(),
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":"Invalid"}`),
+			err:     nil,
+		},
+		{
+			about: "example with /status subresource",
+			in: []byte(`{
+	  "kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
+	  "metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Status: PostgresStatus{PostgresClusterStatus: ClusterStatusInvalid},
+				// This error message can vary between Go versions, so compute it for the current version.
+				Error: json.Unmarshal([]byte(`{
+				"kind": "Postgresql","apiVersion": "acid.zalan.do/v1",
+				"metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": 100}}`), &tmp).Error(),
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":{"PostgresClusterStatus":"Invalid"}}`),
+			err:     nil,
+		},
+		{
+			about: "example with clone",
+			in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "clone": {"cluster": "team-batman"}}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Spec: PostgresSpec{
+					TeamID: "acid",
+					Clone: &CloneDescription{
+						ClusterName: "team-batman",
+					},
+				},
+				Error: "",
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":{"cluster":"team-batman"}},"status":{"PostgresClusterStatus":""}}`),
+			err:     nil,
+		},
+		{
+			about: "standby example",
+			in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "standby": {"s3_wal_path": "s3://custom/path/to/bucket/"}}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Spec: PostgresSpec{
+					TeamID: "acid",
+					StandbyCluster: &StandbyDescription{
+						S3WalPath: "s3://custom/path/to/bucket/",
+					},
+				},
+				Error: "",
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"standby":{"s3_wal_path":"s3://custom/path/to/bucket/"}},"status":{"PostgresClusterStatus":""}}`),
+			err:     nil,
+		},
+		{
+			about: "lifecycle with stopped phase",
+			in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "lifecycle": {"phase": "stopped"}}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Spec: PostgresSpec{
+					TeamID: "acid",
+					Lifecycle: &LifecycleSpec{
+						Phase: LifecyclePhaseStopped,
+					},
+				},
+				Error: "",
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"lifecycle":{"phase":"stopped"}},"status":{"PostgresClusterStatus":""}}`),
+			err:     nil,
+		},
+		{
+			about: "lifecycle with empty phase (wake-up signal)",
+			in:    []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1","metadata": {"name": "acid-testcluster1"}, "spec": {"teamId": "acid", "lifecycle": {"phase": ""}}}`),
+			out: Postgresql{
+				TypeMeta: metav1.TypeMeta{
+					Kind:       "Postgresql",
+					APIVersion: "acid.zalan.do/v1",
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "acid-testcluster1",
+				},
+				Spec: PostgresSpec{
+					TeamID:    "acid",
+					Lifecycle: &LifecycleSpec{Phase: ""},
+				},
+				Error: "",
+			},
+			marshal: []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster1","creationTimestamp":null},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"lifecycle":{"phase":""}},"status":{"PostgresClusterStatus":""}}`),
+			err:     nil,
+		},
+		{
+			about:   "expect error on malformatted JSON",
+			in:      []byte(`{"kind": "Postgresql","apiVersion": "acid.zalan.do/v1"`),
+			out:     Postgresql{},
+			marshal: []byte{},
+			err:     errors.New("unexpected end of JSON input"),
+		},
+		{
+			about:   "expect error on JSON with field's value malformatted",
+			in:      []byte(`{"kind":"Postgresql","apiVersion":"acid.zalan.do/v1","metadata":{"name":"acid-testcluster","creationTimestamp":qaz},"spec":{"postgresql":{"version":"","parameters":null},"volume":{"size":"","storageClass":""},"patroni":{"initdb":null,"pg_hba":null,"ttl":0,"loop_wait":0,"retry_timeout":0,"maximum_lag_on_failover":0,"slots":null},"resources":{"requests":{"cpu":"","memory":""},"limits":{"cpu":"","memory":""}},"teamId":"acid","allowedSourceRanges":null,"numberOfInstances":0,"users":null,"clone":null},"status":{"PostgresClusterStatus":"Invalid"}}`),
+			out:     Postgresql{},
+			marshal: []byte{},
+			err:     errors.New("invalid character 'q' looking for beginning of value"),
+		},
+	}
+)
 
 var postgresqlList = []struct {
 	about string
@@ -266,7 +383,8 @@ var postgresqlList = []struct {
 	out   PostgresqlList
 	err   error
 }{
-	{"expect success", []byte(`{"apiVersion":"v1","items":[{"apiVersion":"acid.zalan.do/v1","kind":"Postgresql","metadata":{"labels":{"team":"acid"},"name":"acid-testcluster42","namespace":"default","resourceVersion":"30446957","selfLink":"/apis/acid.zalan.do/v1/namespaces/default/postgresqls/acid-testcluster42","uid":"857cd208-33dc-11e7-b20a-0699041e4b03"},"spec":{"allowedSourceRanges":["185.85.220.0/22"],"numberOfInstances":1,"postgresql":{"version":"18"},"teamId":"acid","volume":{"size":"10Gi"}},"status":{"PostgresClusterStatus":"Running"}}],"kind":"List","metadata":{},"resourceVersion":"","selfLink":""}`),
+	{
+		"expect success", []byte(`{"apiVersion":"v1","items":[{"apiVersion":"acid.zalan.do/v1","kind":"Postgresql","metadata":{"labels":{"team":"acid"},"name":"acid-testcluster42","namespace":"default","resourceVersion":"30446957","selfLink":"/apis/acid.zalan.do/v1/namespaces/default/postgresqls/acid-testcluster42","uid":"857cd208-33dc-11e7-b20a-0699041e4b03"},"spec":{"allowedSourceRanges":["185.85.220.0/22"],"numberOfInstances":1,"postgresql":{"version":"18"},"teamId":"acid","volume":{"size":"10Gi"}},"status":{"PostgresClusterStatus":"Running"}}],"kind":"List","metadata":{},"resourceVersion":"","selfLink":""}`),
 		PostgresqlList{
 			TypeMeta: metav1.TypeMeta{
 				Kind:       "List",
@@ -299,19 +417,24 @@ var postgresqlList = []struct {
 				Error: "",
 			}},
 		},
-		nil},
-	{"expect error on malformatted JSON", []byte(`{"apiVersion":"v1","items":[{"apiVersion":"acid.zalan.do/v1","kind":"Postgresql","metadata":{"labels":{"team":"acid"},"name":"acid-testcluster42","namespace"`),
+		nil,
+	},
+	{
+		"expect error on malformatted JSON", []byte(`{"apiVersion":"v1","items":[{"apiVersion":"acid.zalan.do/v1","kind":"Postgresql","metadata":{"labels":{"team":"acid"},"name":"acid-testcluster42","namespace"`),
 		PostgresqlList{},
-		errors.New("unexpected end of JSON input")}}
+		errors.New("unexpected end of JSON input"),
+	},
+}
 
 var podAnnotations = []struct {
 	about       string
 	in          []byte
 	annotations map[string]string
 	err         error
-}{{
-	about: "common annotations",
-	in: []byte(`{
+}{
+	{
+		about: "common annotations",
+		in: []byte(`{
 		"kind": "Postgresql",
 		"apiVersion": "acid.zalan.do/v1",
 		"metadata": {
@@ -327,8 +450,9 @@ var podAnnotations = []struct {
 			}
 		}
 	}`),
-	annotations: map[string]string{"foo": "bar"},
-	err:         nil},
+		annotations: map[string]string{"foo": "bar"},
+		err:         nil,
+	},
 }
 
 var serviceAnnotations = []struct {
@@ -549,7 +673,6 @@ func TestMarshalMaintenanceWindow(t *testing.T) {
 func TestUnmarshalPostgresStatus(t *testing.T) {
 	for _, tt := range postgresStatus {
 		t.Run(tt.about, func(t *testing.T) {
-
 			var ps PostgresStatus
 			err := ps.UnmarshalJSON(tt.in)
 			if err != nil {
@@ -590,7 +713,6 @@ func TestPostgresUnmarshal(t *testing.T) {
 func TestMarshal(t *testing.T) {
 	for _, tt := range unmarshalCluster {
 		t.Run(tt.about, func(t *testing.T) {
-
 			if tt.err != nil {
 				return
 			}
@@ -623,7 +745,6 @@ func TestMarshal(t *testing.T) {
 func TestPostgresMeta(t *testing.T) {
 	for _, tt := range unmarshalCluster {
 		t.Run(tt.about, func(t *testing.T) {
-
 			if a := tt.out.GetObjectKind(); a != &tt.out.TypeMeta {
 				t.Errorf("GetObjectKindMeta \nexpected: %v, \ngot:       %v", tt.out.TypeMeta, a)
 			}
@@ -707,5 +828,98 @@ func TestAllowedSourceRangesPattern(t *testing.T) {
 		if re.MatchString(cidr) {
 			t.Errorf("expected %q NOT to match allowedSourceRanges pattern", cidr)
 		}
+	}
+}
+
+func TestLifecyclePhaseStopped(t *testing.T) {
+	for _, tt := range lifecyclePhases {
+		t.Run(tt.about, func(t *testing.T) {
+			if got := tt.in.Stopped(); got != tt.out {
+				t.Errorf("Expected Stopped()=%v, got %v", tt.out, got)
+			}
+		})
+	}
+}
+
+func TestLifecyclePhaseConstantValue(t *testing.T) {
+	if LifecyclePhaseStopped != "stopped" {
+		t.Errorf("Expected LifecyclePhaseStopped=%q, got %q", "stopped", LifecyclePhaseStopped)
+	}
+	if string(LifecyclePhaseStopped) != "stopped" {
+		t.Errorf("Expected string(LifecyclePhaseStopped)=%q, got %q", "stopped", string(LifecyclePhaseStopped))
+	}
+}
+
+func TestLifecycleSpecJSONRoundTrip(t *testing.T) {
+	for _, tt := range lifecycleSpecJSON {
+		t.Run(tt.about, func(t *testing.T) {
+			var ls LifecycleSpec
+			err := json.Unmarshal(tt.in, &ls)
+			if err != nil {
+				if tt.err == nil || err.Error() != tt.err.Error() {
+					t.Errorf("Unmarshal expected error: %v, got: %v", tt.err, err)
+				}
+				return
+			} else if tt.err != nil {
+				t.Errorf("Expected error: %v", tt.err)
+			}
+
+			if ls != tt.out {
+				t.Errorf("Expected LifecycleSpec: %#v, got %#v", tt.out, ls)
+			}
+
+			s, err := json.Marshal(tt.out)
+			if err != nil {
+				t.Errorf("Marshal error: %v", err)
+			}
+			if !bytes.Equal(s, tt.marshal) {
+				t.Errorf("Expected Marshal: %q, got: %q", string(tt.marshal), string(s))
+			}
+		})
+	}
+}
+
+func TestPostgresStatusDeepCopy(t *testing.T) {
+	orig := &PostgresStatus{
+		PostgresClusterStatus: ClusterStatusStopped,
+		PreviousPoolerInstances: map[string]int32{
+			"acid-cluster-1": 2,
+			"acid-cluster-2": 3,
+		},
+	}
+
+	cp := orig.DeepCopy()
+
+	if cp == orig {
+		t.Fatal("DeepCopy should return a different pointer")
+	}
+	if cp.PostgresClusterStatus != orig.PostgresClusterStatus {
+		t.Errorf("Expected PostgresClusterStatus to match: got %q, want %q",
+			cp.PostgresClusterStatus, orig.PostgresClusterStatus)
+	}
+	if len(cp.PreviousPoolerInstances) != len(orig.PreviousPoolerInstances) {
+		t.Fatalf("Expected %d entries in copy, got %d",
+			len(orig.PreviousPoolerInstances), len(cp.PreviousPoolerInstances))
+	}
+
+	cp.PreviousPoolerInstances["acid-cluster-3"] = 4
+	cp.PreviousPoolerInstances["acid-cluster-1"] = 99
+
+	if _, ok := orig.PreviousPoolerInstances["acid-cluster-3"]; ok {
+		t.Errorf("DeepCopy shared map: adding to copy leaked entry into original")
+	}
+	if orig.PreviousPoolerInstances["acid-cluster-1"] != 2 {
+		t.Errorf("DeepCopy shared map: expected acid-cluster-1=2 in original, got %d",
+			orig.PreviousPoolerInstances["acid-cluster-1"])
+	}
+
+	nilStatus := &PostgresStatus{}
+	nilCp := nilStatus.DeepCopy()
+	if nilCp == nil {
+		t.Fatal("DeepCopy of zero-value PostgresStatus should not return nil")
+	}
+	if !reflect.DeepEqual(nilStatus, nilCp) {
+		t.Errorf("DeepCopy of zero-value PostgresStatus should match: got %#v, want %#v",
+			nilCp, nilStatus)
 	}
 }

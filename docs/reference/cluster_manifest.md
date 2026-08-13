@@ -48,6 +48,10 @@ Those parameters are grouped under the `metadata` top-level key.
   Labels that are set here but not listed as `inherited_labels` in the operator
   parameters are ignored.
 
+* **annotations**
+  A map of annotations to add to the `postgresql` resource. The operator reacts to certain annotations, for instance, to trigger specific actions.
+  * `postgres-operator.zalando.org/action: restore-in-place`: When this annotation is present with this value, the operator will trigger an automated in-place restore of the cluster. This process requires a valid `clone` section to be defined in the manifest with a target `timestamp`. See the [user guide](../user.md#automated-restore-in-place-point-in-time-recovery) for more details.
+
 ## Top-level parameters
 
 These parameters are grouped directly under  the `spec` key in the manifest.
@@ -531,6 +535,37 @@ Note that `s3_wal_path` and `gs_wal_path` are mutually exclusive.
   from a remote primary. See the Patroni documentation
   [here](https://patroni.readthedocs.io/en/latest/standby_cluster.html) for more details. Optional.
 
+## Lifecycle configuration
+
+Parameters to control cluster hibernate/wake-up behavior.
+
+* **phase**
+  Set to `"stopped"` to hibernate the cluster. When this field is set on a
+  running cluster, the operator will:
+  * Store the current number of instances in the status
+  * Scale down the StatefulSet to 0 replicas
+  * Scale down the connection pooler to 0 replicas
+  * Suspend the logical backup CronJob (if enabled)
+  * Set the cluster status to "Stopping", then "Stopped"
+
+  When this field is removed, or set to an empty string, on a stopped
+  cluster, the operator will:
+  * Restore the number of instances from `status.previousNumberOfInstances`
+  * Scale up the StatefulSet and connection pooler
+  * Resume the logical backup CronJob (if it was suspended)
+  * Set the cluster status to "Updating", then "Running"
+
+  This field is optional. When not set, the cluster operates normally.
+
+  Note: the CRD schema accepts `""` as well as `"stopped"` for `lifecycle.phase`.
+  Both forms are equivalent to omitting the field, and either form triggers the
+  wake-up path described above.
+
+  Note: if `status.previousNumberOfInstances` is 0 (for example due to a partial
+  write or a manual edit), the operator will not transition the cluster out of
+  `Stopped`. Edit `spec.numberOfInstances` to a positive value to wake it up
+  manually.
+
 ## Volume properties
 
 Those parameters are grouped under the `volume` top-level key and define the
@@ -759,3 +794,21 @@ can have the following properties:
 
 * **memory**
   memory requests to be set as an annotation on the stream resource. Optional.
+
+## Status fields
+
+The operator reports the cluster state through the `status` sub-resource. These
+fields are managed by the operator and should not be set manually.
+
+* **PostgresClusterStatus**
+  Current state of the cluster. One of: Creating, Updating, Running,
+  UpdateFailed, SyncFailed, CreateFailed, Invalid, Stopping, Stopped.
+
+* **previousNumberOfInstances**
+  The number of instances the cluster had before hibernation. Used to restore
+  the cluster to its previous size when waking up. Cleared after wake-up.
+
+* **previousPoolerInstances**
+  A map of connection pooler role to its replica count before hibernation.
+  The keys are "master" and "replica". Used to restore the pooler when waking
+  up. Cleared after wake-up.
