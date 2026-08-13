@@ -708,6 +708,8 @@ spec:
                   enable_patroni_failsafe_mode:
                     type: boolean
                 type: object
+              pitr_backup_retention:
+                type: string
               postgres_pod_resources:
                 description: PostgresPodResourcesDefaults defines the spec of default
                   resources

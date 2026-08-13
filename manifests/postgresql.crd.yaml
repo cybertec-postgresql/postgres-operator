@@ -2021,6 +2021,18 @@ spec:
                   - name
                   type: object
                 type: array
+              lifecycle:
+                description: LifecycleSpec describes the lifecycle state of a Postgres
+                  cluster.
+                properties:
+                  phase:
+                    description: LifecyclePhase describes the desired lifecycle state
+                      of a Postgres cluster.
+                    enum:
+                    - ""
+                    - stopped
+                    type: string
+                type: object
               livenessProbe:
                 description: |-
                   Probe describes a health check to be performed against a container to determine whether it is
@@ -2173,18 +2185,6 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle#container-probes
                     format: int32
                     type: integer
-                type: object
-              lifecycle:
-                description: LifecycleSpec describes the lifecycle state of a Postgres
-                  cluster.
-                properties:
-                  phase:
-                    description: LifecyclePhase describes the desired lifecycle state
-                      of a Postgres cluster.
-                    enum:
-                    - ""
-                    - stopped
-                    type: string
                 type: object
               logicalBackupRetention:
                 type: string
@@ -3356,10 +3356,10 @@ spec:
                 format: int32
                 type: integer
               previousPoolerInstances:
-                type: object
                 additionalProperties:
                   format: int32
                   type: integer
+                type: object
             required:
             - PostgresClusterStatus
             type: object

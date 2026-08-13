@@ -517,6 +517,11 @@ func (in *OperatorConfigurationData) DeepCopyInto(out *OperatorConfigurationData
 	in.LogicalBackup.DeepCopyInto(&out.LogicalBackup)
 	in.ConnectionPooler.DeepCopyInto(&out.ConnectionPooler)
 	in.Patroni.DeepCopyInto(&out.Patroni)
+	if in.PitrBackupRetention != nil {
+		in, out := &in.PitrBackupRetention, &out.PitrBackupRetention
+		*out = new(metav1.Duration)
+		**out = **in
+	}
 	return
 }
 

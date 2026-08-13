@@ -2021,6 +2021,18 @@ spec:
                   - name
                   type: object
                 type: array
+              lifecycle:
+                description: LifecycleSpec describes the lifecycle state of a Postgres
+                  cluster.
+                properties:
+                  phase:
+                    description: LifecyclePhase describes the desired lifecycle state
+                      of a Postgres cluster.
+                    enum:
+                    - ""
+                    - stopped
+                    type: string
+                type: object
               livenessProbe:
                 description: |-
                   Probe describes a health check to be performed against a container to determine whether it is
@@ -3340,6 +3352,14 @@ spec:
             properties:
               PostgresClusterStatus:
                 type: string
+              previousNumberOfInstances:
+                format: int32
+                type: integer
+              previousPoolerInstances:
+                additionalProperties:
+                  format: int32
+                  type: integer
+                type: object
             required:
             - PostgresClusterStatus
             type: object
