@@ -1,10 +1,10 @@
 name: operator-tests
 
-on: 
+on:
   pull_request:
-  push:
     branches:
-    - master
+      - scalefield_v*
+  workflow_dispatch:
 
 jobs:
   tests:

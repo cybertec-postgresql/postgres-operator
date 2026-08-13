@@ -3,9 +3,9 @@ name: operator-e2e-tests
 on:
   workflow_call:
   pull_request:
-  push:
     branches:
-    - master
+      - scalefield_v*
+  workflow_dispatch:
 
 jobs:
   tests:
