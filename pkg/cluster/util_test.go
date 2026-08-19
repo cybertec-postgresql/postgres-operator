@@ -53,6 +53,7 @@ func newFakeK8sAnnotationsClient() (k8sutil.KubernetesClient, *k8sFake.Clientset
 		EndpointsGetter:              clientSet.CoreV1(),
 		ConfigMapsGetter:             clientSet.CoreV1(),
 		PodsGetter:                   clientSet.CoreV1(),
+		ServiceAccountsGetter:        clientSet.CoreV1(),
 		DeploymentsGetter:            clientSet.AppsV1(),
 		CronJobsGetter:               clientSet.BatchV1(),
 	}, clientSet
@@ -297,9 +298,9 @@ func newInheritedAnnotationsCluster(client k8sutil.KubernetesClient) (*Cluster, 
 	cluster := New(
 		Config{
 			OpConfig: config.Config{
-				PatroniAPICheckInterval: time.Duration(1),
-				PatroniAPICheckTimeout:  time.Duration(5),
-				KubernetesUseConfigMaps: true,
+				PatroniAPICheckInterval: &metav1.Duration{Duration: 1 * time.Second},
+				PatroniAPICheckTimeout:  &metav1.Duration{Duration: 5 * time.Second},
+				KubernetesUseConfigMaps: util.True(),
 				ConnectionPooler: config.ConnectionPooler{
 					ConnectionPoolerDefaultCPURequest:    "100m",
 					ConnectionPoolerDefaultCPULimit:      "100m",
@@ -318,8 +319,8 @@ func newInheritedAnnotationsCluster(client k8sutil.KubernetesClient) (*Cluster, 
 					DefaultMemoryLimit:    "300Mi",
 					InheritedAnnotations:  []string{"owned-by"},
 					PodRoleLabel:          "spilo-role",
-					ResourceCheckInterval: time.Duration(testResourceCheckInterval),
-					ResourceCheckTimeout:  time.Duration(testResourceCheckTimeout),
+					ResourceCheckInterval: &metav1.Duration{Duration: testResourceCheckInterval},
+					ResourceCheckTimeout:  &metav1.Duration{Duration: testResourceCheckTimeout},
 					MinInstances:          -1,
 					MaxInstances:          -1,
 				},
@@ -388,7 +389,7 @@ func createPatroniResources(cluster *Cluster) error {
 			Labels: cluster.labelsSet(false),
 		}
 
-		if cluster.OpConfig.KubernetesUseConfigMaps {
+		if cluster.OpConfig.KubernetesUseConfigMaps != nil && *cluster.OpConfig.KubernetesUseConfigMaps {
 			configMap := v1.ConfigMap{
 				ObjectMeta: metadata,
 			}
@@ -598,7 +599,7 @@ func TestInheritedAnnotations(t *testing.T) {
 	// 3. Change from ConfigMaps to Endpoints
 	err = cluster.deletePatroniResources()
 	assert.NoError(t, err)
-	cluster.OpConfig.KubernetesUseConfigMaps = false
+	cluster.OpConfig.KubernetesUseConfigMaps = util.False()
 	err = createPatroniResources(cluster)
 	assert.NoError(t, err)
 	err = cluster.Sync(newSpec.DeepCopy())
@@ -773,6 +774,7 @@ func TestIsInMaintenanceWindow(t *testing.T) {
 	cluster := New(
 		Config{
 			OpConfig: config.Config{
+				EnableMaintenanceWindows: util.True(),
 				Resources: config.Resources{
 					ClusterLabels:        map[string]string{"application": "spilo"},
 					ClusterNameLabel:     "cluster-name",
@@ -796,12 +798,27 @@ func TestIsInMaintenanceWindow(t *testing.T) {
 		name          string
 		windows       []acidv1.MaintenanceWindow
 		configWindows []string
+		windowsFlag   bool
 		expected      bool
 	}{
 		{
 			name:          "no maintenance windows",
 			windows:       nil,
 			configWindows: nil,
+			windowsFlag:   true,
+			expected:      true,
+		},
+		{
+			name: "maintenance windows diabled",
+			windows: []acidv1.MaintenanceWindow{
+				{
+					Everyday:  true,
+					StartTime: mustParseTime("00:00"),
+					EndTime:   mustParseTime("23:59"),
+				},
+			},
+			configWindows: nil,
+			windowsFlag:   false,
 			expected:      true,
 		},
 		{
@@ -814,6 +831,7 @@ func TestIsInMaintenanceWindow(t *testing.T) {
 				},
 			},
 			configWindows: nil,
+			windowsFlag:   true,
 			expected:      true,
 		},
 		{
@@ -826,6 +844,7 @@ func TestIsInMaintenanceWindow(t *testing.T) {
 				},
 			},
 			configWindows: nil,
+			windowsFlag:   true,
 			expected:      true,
 		},
 		{
@@ -837,24 +856,35 @@ func TestIsInMaintenanceWindow(t *testing.T) {
 					EndTime:   mustParseTime(futureTimeEndFormatted),
 				},
 			},
-			expected: false,
+			windowsFlag: true,
+			expected:    false,
 		},
 		{
 			name:          "global maintenance windows with future interval time",
 			windows:       nil,
 			configWindows: []string{fmt.Sprintf("%s-%s", futureTimeStartFormatted, futureTimeEndFormatted)},
+			windowsFlag:   true,
 			expected:      false,
 		},
 		{
 			name:          "global maintenance windows all day",
 			windows:       nil,
 			configWindows: []string{"00:00-02:00", "02:00-23:59"},
+			windowsFlag:   true,
+			expected:      true,
+		},
+		{
+			name:          "global maintenance windows ignored",
+			windows:       nil,
+			configWindows: []string{"00:00-02:00", "02:00-23:59"},
+			windowsFlag:   false,
 			expected:      true,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			cluster.OpConfig.EnableMaintenanceWindows = &tt.windowsFlag
 			cluster.OpConfig.MaintenanceWindows = tt.configWindows
 			cluster.Spec.MaintenanceWindows = tt.windows
 			if cluster.isInMaintenanceWindow(cluster.Spec.MaintenanceWindows) != tt.expected {

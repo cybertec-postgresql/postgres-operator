@@ -96,10 +96,7 @@ psql -U postgres -h localhost -p 6432
 
 ## Password encryption
 
-Passwords are encrypted with `md5` hash generation by default. However, it is
-possible to use the more recent `scram-sha-256` method by changing the
-`password_encryption` parameter in the Postgres config. You can define it
-directly from the cluster manifest:
+Passwords are encrypted using the `scram-sha-256` hashing method by default. Other methods can be configured by changing the `password_encryption` parameter in the cluster manifest:
 
 ```yaml
 apiVersion: "acid.zalan.do/v1"
@@ -714,7 +711,7 @@ but Kubernetes will not spin up the pod if the requested HugePages cannot be all
 For more information on HugePages in Kubernetes, see also
 [https://kubernetes.io/docs/tasks/manage-hugepages/scheduling-hugepages/](https://kubernetes.io/docs/tasks/manage-hugepages/scheduling-hugepages/)
 
-## Use taints, tolerations and node affinity for dedicated PostgreSQL nodes
+## Use taints, tolerations, node affinity and topology spread constraint for dedicated PostgreSQL nodes
 
 To ensure Postgres pods are running on nodes without any other application pods,
 you can use [taints and tolerations](https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/)
@@ -754,6 +751,23 @@ spec:
 
 If you need to define a `nodeAffinity` for all your Postgres clusters use the
 `node_readiness_label` [configuration](administrator.md#node-readiness-labels).
+
+If you need PostgreSQL Pods to run on separate nodes, you can use the
+[topologySpreadConstraints](https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/) to control how they are distributed across your cluster.
+This ensures they are spread among failure domains such as
+regions, zones, nodes, or other user-defined topology domains.
+
+```yaml
+apiVersion: "acid.zalan.do/v1"
+kind: postgresql
+metadata:
+  name: acid-minimal-cluster
+spec:
+  topologySpreadConstraints:
+    - maxskew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: DoNotSchedule
+```
 
 ## In-place major version upgrade
 
@@ -1204,7 +1218,7 @@ spec:
     - all
     volumeSource:
       emptyDir: {}
-  sidecars: 
+  sidecars:
   - name: "container-name"
     image: "company/image:tag"
     volumeMounts:
@@ -1255,7 +1269,7 @@ When using AWS with gp3 volumes you should set the mode to `mixed` because it
 will also adjust the IOPS and throughput that can be defined in the manifest.
 Check the [AWS docs](https://aws.amazon.com/ebs/general-purpose/) to learn
 about default and maximum values. Keep in mind that AWS rate-limits updating
-volume specs to no more than once every 6 hours.
+volume specs to no more than 4 times within 24 hours.
 
 ```yaml
 spec:

@@ -167,6 +167,14 @@ func metaAnnotationsPatch(annotations map[string]string) ([]byte, error) {
 	}{&meta})
 }
 
+func metaLabelsPatch(labels map[string]string) ([]byte, error) {
+	var meta metav1.ObjectMeta
+	meta.Labels = labels
+	return json.Marshal(struct {
+		ObjMeta interface{} `json:"metadata"`
+	}{&meta})
+}
+
 func (c *Cluster) logPDBChanges(old, new *policyv1.PodDisruptionBudget, isUpdate bool, reason string) {
 	if isUpdate {
 		c.logger.Infof("pod disruption budget %q has been changed", util.NameFromMeta(old.ObjectMeta))
@@ -334,7 +342,7 @@ func (c *Cluster) annotationsSet(annotations map[string]string) map[string]strin
 }
 
 func (c *Cluster) waitForPodLabel(podEvents chan PodEvent, stopCh chan struct{}, role *PostgresRole) (*v1.Pod, error) {
-	timeout := time.After(c.OpConfig.PodLabelWaitTimeout)
+	timeout := time.After(c.OpConfig.PodLabelWaitTimeout.Duration)
 	for {
 		select {
 		case podEvent := <-podEvents:
@@ -356,7 +364,7 @@ func (c *Cluster) waitForPodLabel(podEvents chan PodEvent, stopCh chan struct{},
 }
 
 func (c *Cluster) waitForPodDeletion(podEvents chan PodEvent) error {
-	timeout := time.After(c.OpConfig.PodDeletionWaitTimeout)
+	timeout := time.After(c.OpConfig.PodDeletionWaitTimeout.Duration)
 	for {
 		select {
 		case podEvent := <-podEvents:
@@ -370,7 +378,7 @@ func (c *Cluster) waitForPodDeletion(podEvents chan PodEvent) error {
 }
 
 func (c *Cluster) waitStatefulsetReady() error {
-	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
+	return retryutil.Retry(c.OpConfig.ResourceCheckInterval.Duration, c.OpConfig.ResourceCheckTimeout.Duration,
 		func() (bool, error) {
 			listOptions := metav1.ListOptions{
 				LabelSelector: c.labelsSet(false).String(),
@@ -420,7 +428,7 @@ func (c *Cluster) _waitPodLabelsReady(anyReplica bool) error {
 		c.logger.Debug("Waiting for any replica pod to become ready")
 	}
 
-	err := retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.ResourceCheckTimeout,
+	err := retryutil.Retry(c.OpConfig.ResourceCheckInterval.Duration, c.OpConfig.ResourceCheckTimeout.Duration,
 		func() (bool, error) {
 			masterCount := 0
 			if !anyReplica {
@@ -476,7 +484,7 @@ func (c *Cluster) waitStatefulsetPodsReady() error {
 // On timeout, returns an error so callers can surface it to the controller.
 func (c *Cluster) waitStatefulsetPodsGone() error {
 	c.setProcessName("waiting for statefulset pods to terminate")
-	return retryutil.Retry(c.OpConfig.ResourceCheckInterval, c.OpConfig.PodTerminateGracePeriod,
+	return retryutil.Retry(c.OpConfig.ResourceCheckInterval.Duration, c.OpConfig.PodTerminateGracePeriod.Duration,
 		func() (bool, error) {
 			sts, err := c.KubeClient.StatefulSets(c.Namespace).Get(
 				context.TODO(), c.statefulSetName(), metav1.GetOptions{})
@@ -642,9 +650,12 @@ func (c *Cluster) patroniKubernetesUseConfigMaps() bool {
 	if !c.patroniUsesKubernetes() {
 		return false
 	}
+	if c.OpConfig.KubernetesUseConfigMaps == nil {
+		return true
+	}
 
 	// otherwise, follow the operator configuration
-	return c.OpConfig.KubernetesUseConfigMaps
+	return *c.OpConfig.KubernetesUseConfigMaps
 }
 
 // Earlier arguments take priority
@@ -698,7 +709,9 @@ func isStandbyCluster(spec *acidv1.PostgresSpec) bool {
 }
 
 func (c *Cluster) isInMaintenanceWindow(specMaintenanceWindows []acidv1.MaintenanceWindow) bool {
-	if len(specMaintenanceWindows) == 0 && len(c.OpConfig.MaintenanceWindows) == 0 {
+	ignoreMaintenanceWindows := c.OpConfig.EnableMaintenanceWindows != nil && !*c.OpConfig.EnableMaintenanceWindows
+	noWindowsDefined := len(specMaintenanceWindows) == 0 && len(c.OpConfig.MaintenanceWindows) == 0
+	if noWindowsDefined || ignoreMaintenanceWindows {
 		return true
 	}
 	now := time.Now()

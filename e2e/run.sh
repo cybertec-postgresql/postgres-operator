@@ -8,7 +8,7 @@ IFS=$'\n\t'
 
 readonly cluster_name="postgres-operator-e2e-tests"
 readonly kubeconfig_path="${HOME}/kind-config-${cluster_name}"
-readonly spilo_image="ghcr.io/zalando/spilo-18:4.1-p1"
+readonly spilo_image="ghcr.io/zalando/spilo-18:4.1-p2"
 readonly e2e_test_runner_image="ghcr.io/zalando/postgres-operator-e2e-tests-runner:latest"
 
 export GOPATH=${GOPATH-~/go}
@@ -24,19 +24,44 @@ esac
 echo "Clustername: ${cluster_name}"
 echo "Kubeconfig path: ${kubeconfig_path}"
 
+# Helper function to pull images directly into kind nodes via crictl (bypasses host disk duplication)
+function pull_on_kind_nodes() {
+  local img="$1"
+  echo "Pulling ${img} directly on kind nodes..."
+  for node in $(kind get nodes --name "${cluster_name}"); do
+    docker exec "$node" crictl pull "${img}"
+  done
+}
+
 function pull_images(){
   operator_tag=$(git describe --tags --always --dirty)
-  image_name="ghcr.io/zalando/postgres-operator:${operator_tag}"
-  if [[ -z $(docker images -q "${image_name}") ]]
-  then
-    if ! docker pull "${image_name}"
-    then
-      echo "Failed to pull operator image: ${image_name}"
-      exit 1
+  components=("postgres-operator" "pooler")
+  image_urls=("ghcr.io/zalando/postgres-operator:${operator_tag}" "ghcr.io/zalando/postgres-operator/pgbouncer:${operator_tag}")
+
+  for i in "${!components[@]}"; do
+    component="${components[$i]}"
+    image="${image_urls[$i]}"
+
+    if [[ -z $(docker images -q "$image") ]]; then
+      echo "Pulling $component image: $image"
+      if ! docker pull "$image"; then
+        echo "Failed to pull $component image: $image"
+        exit 1
+      fi
+    else
+      echo "$component image already exists: $image"
     fi
-  fi
-  operator_image="${image_name}"
-  echo "Using operator image: ${operator_image}"
+
+    # Set variables for later use
+    if [[ "$component" == "postgres-operator" ]]; then
+      operator_image="$image"
+    elif [[ "$component" == "pooler" ]]; then
+      pooler_image="$image"
+    fi
+  done
+
+  echo "Using operator image: $operator_image"
+  echo "Using pooler image: $pooler_image"
 }
 
 function start_kind(){
@@ -50,15 +75,16 @@ function start_kind(){
   export KUBECONFIG="${kubeconfig_path}"
   kind create cluster --name ${cluster_name} --config kind-cluster-postgres-operator-e2e-tests.yaml  
   
-  echo "Pulling Spilo image for platform ${PLATFORM}"
-  docker pull --platform ${PLATFORM} "${spilo_image}"
-  kind load docker-image "${spilo_image}" --name ${cluster_name}
+  echo "Pulling Spilo image on kind nodes directly..."
+  pull_on_kind_nodes "${spilo_image}"
 }
 
-function load_operator_image() {
-  echo "Loading operator image"
+function load_operator_images() {
+  echo "Loading operator images"
   export KUBECONFIG="${kubeconfig_path}"
+  # For locally built operator images, kind load is still fine since they're light
   kind load docker-image "${operator_image}" --name ${cluster_name}
+  kind load docker-image "${pooler_image}" --name ${cluster_name}
 }
 
 function set_kind_api_server_ip(){
@@ -85,7 +111,8 @@ function run_tests(){
   --mount type=bind,source="$(readlink -f tests)",target=/tests \
   --mount type=bind,source="$(readlink -f exec.sh)",target=/exec.sh \
   --mount type=bind,source="$(readlink -f scripts)",target=/scripts \
-  -e OPERATOR_IMAGE="${operator_image}" "${e2e_test_runner_image}" ${E2E_TEST_CASE-} $@
+  -e OPERATOR_IMAGE="${operator_image}" -e POOLER_IMAGE="${pooler_image}" \
+  "${e2e_test_runner_image}" ${E2E_TEST_CASE-} $@
 }
 
 function cleanup(){
@@ -100,7 +127,7 @@ function main(){
   [[ -z ${NOCLEANUP-} ]] && trap "cleanup" QUIT TERM EXIT
   pull_images
   [[ ! -f ${kubeconfig_path} ]] && start_kind
-  load_operator_image
+  load_operator_images
   set_kind_api_server_ip
   generate_certificate
 

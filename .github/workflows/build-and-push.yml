@@ -8,11 +8,8 @@ on:
     branches:
       - 'scalefield_v*'
   push:
-    paths-ignore:
-      - '**.md'
-      - 'docs/**'
-    branches:
-      - 'scalefield_v*'
+    tags:
+      - '*'
   workflow_dispatch:
     inputs:
       image_tags:
@@ -37,6 +34,14 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "^1.26.4"
+
+      - name: Run unit tests
+        run: make mocks && go test -race ./...
 
       - name: Determine tags
         id: tags

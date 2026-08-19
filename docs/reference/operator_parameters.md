@@ -44,14 +44,14 @@ and change it.
 
 To test the CRD-based configuration locally, use the following
 
-```bash
-  kubectl create -f manifests/operatorconfiguration.crd.yaml # registers the CRD
-  kubectl create -f manifests/postgresql-operator-default-configuration.yaml
+```
+kubectl create -f manifests/operatorconfiguration.crd.yaml # registers the CRD
+kubectl create -f manifests/postgresql-operator-default-configuration.yaml
 
-  kubectl create -f manifests/operator-service-account-rbac.yaml
-  kubectl create -f manifests/postgres-operator.yaml # set the env var as mentioned above
+kubectl create -f manifests/operator-service-account-rbac.yaml
+kubectl create -f manifests/postgres-operator.yaml # set the env var as mentioned above
 
-  kubectl get operatorconfigurations postgresql-operator-default-configuration -o yaml
+kubectl get operatorconfigurations postgresql-operator-default-configuration -o yaml
 ```
 
 The CRD-based configuration is more powerful than the one based on ConfigMaps
@@ -81,11 +81,6 @@ Those are top-level keys, containing both leaf keys and groups.
   Instruct the operator to create/update the CRDs. If disabled the operator will rely on the CRDs being managed separately.
   The default is `true`.
 
-* **enable_crd_validation**
-  *deprecated*: toggles if the operator will create or update CRDs with
-  [OpenAPI v3 schema validation](https://kubernetes.io/docs/tasks/access-kubernetes-api/custom-resources/custom-resource-definitions/#validation)
-  The default is `true`. `false` will be ignored, since `apiextensions.io/v1` requires a structural schema definition.
-
 * **crd_categories**
   The operator will register CRDs in the `all` category by default so that they will be returned by a `kubectl get all` call. You are free to change categories or leave them empty.
 
@@ -107,15 +102,13 @@ Those are top-level keys, containing both leaf keys and groups.
   Kubernetes-native DCS).
 
 * **kubernetes_use_configmaps**
-  Select if setup uses endpoints (default), or configmaps to manage leader when
+  Select if setup uses endpoints or configmaps (default) to manage leader when
   DCS is kubernetes (not etcd or similar). In OpenShift it is not possible to
   use endpoints option, and configmaps is required. Starting with K8s 1.33,
   endpoints are marked as deprecated. It's recommended to switch to config maps
   instead. But, to do so make sure you scale the Postgres cluster down to just
   one primary pod (e.g. using `max_instances` option). Otherwise, you risk
-  running into a split-brain scenario.
-  By default, `kubernetes_use_configmaps: false`, meaning endpoints will be used.
-  Starting from v1.16.0 the default will be changed to `true`.
+  running into a split-brain scenario. Default is `true`.
 
 * **docker_image**
   Spilo Docker image for Postgres instances. For production, don't rely on the
@@ -174,6 +167,9 @@ Those are top-level keys, containing both leaf keys and groups.
   an annotation key that can be used as a toggle in cluster manifests to ignore
   the thresholds. The value must be `"true"` to be effective. The default is empty
   which means the feature is disabled.
+
+* **enable_maintenance_windows**
+  toggle for using the maintenance windows feature. Default is `"true"`.
 
 * **maintenance_windows**
   a list which defines specific time frames when certain maintenance
@@ -339,6 +335,10 @@ configuration they are grouped under the `kubernetes` key.
 * **pod_terminate_grace_period**
   Postgres pods are [terminated forcefully](https://kubernetes.io/docs/concepts/workloads/pods/pod-lifecycle/#pod-termination)
   after this timeout. The default is `5m`.
+
+* **liveness_probe**
+  Allows for adding a liveness probe to the Spilo container to detect if it's
+  running properly. Cannot be configured via ConfigMap. Default is empty.
 
 * **custom_pod_annotations**
   This key/value map provides a list of annotations that get attached to each pod
@@ -599,7 +599,7 @@ configuration they are grouped under the `kubernetes` key.
     1. `ebs`   : operator resizes EBS volumes directly and executes `resizefs` within a pod
     2. `pvc`   : operator only changes PVC definition
     3. `off`   : disables resize of the volumes.
-    4. `mixed` : operator uses AWS API to adjust size, throughput, and IOPS, and calls pvc change for file system resize
+    4. `mixed` : operator uses AWS API to adjust size, type, throughput, and IOPS, and calls pvc change for file system resize
     Default is "pvc".
 
 ## Kubernetes resource requests
@@ -815,6 +815,15 @@ yet officially supported.
   [kube2iam](https://github.com/jtblin/kube2iam) project on AWS. The default is
   empty.
 
+* **irsa_role_arn**
+  Full AWS IAM role ARN to supply in the `eks.amazonaws.com/role-arn` annotation
+  of the Postgres pod service account, enabling
+  [IRSA](https://docs.aws.amazon.com/eks/latest/userguide/iam-roles-for-service-accounts.html)
+  (IAM Roles for Service Accounts) on EKS. When set, the operator annotates the
+  pod service account on every sync so that the EKS OIDC webhook can inject AWS
+  credentials directly into pods. Must be a full ARN, e.g.
+  `arn:aws:iam::123456789012:role/my-postgres-role`. The default is empty.
+
 * **aws_region**
   AWS region used to store EBS volumes. The default is `eu-central-1`. Note,
   this option is not meant for specifying the AWS region for backups and
@@ -828,16 +837,6 @@ yet officially supported.
 * **additional_secret_mount_path**
   Path to mount the above Secret in the filesystem of the container(s).
   The default is empty.
-
-* **enable_ebs_gp3_migration**
-  enable automatic migration on AWS from gp2 to gp3 volumes, that are smaller
-  than the configured max size (see below). This ignores that EBS gp3 is by
-  default only 125 MB/sec vs 250 MB/sec for gp2 >= 333GB.
-  The default is `false`.
-
-* **enable_ebs_gp3_migration_max_size**
-  defines the maximum volume size in GB until which auto migration happens.
-  Default is 1000 (1TB) which matches 3000 IOPS.
 
 ## Logical backup
 
@@ -857,7 +856,7 @@ grouped under the `logical_backup` key.
   runs `pg_dumpall` on a replica if possible and uploads compressed results to
   an S3 bucket under the key `/<configured-s3-bucket-prefix>/<pg_cluster_name>/<cluster_k8s_uuid>/logical_backups`.
   The default image is the same image built with the Zalando-internal CI
-  pipeline. Default: "ghcr.io/zalando/postgres-operator/logical-backup:v1.15.1"
+  pipeline. Default: "ghcr.io/zalando/postgres-operator/logical-backup:v2.0.1"
 
 * **logical_backup_google_application_credentials**
   Specifies the path of the google cloud service account json file. Default is empty.
@@ -913,6 +912,28 @@ grouped under the `logical_backup` key.
 
 * **logical_backup_cronjob_environment_secret**
   Reference to a Kubernetes secret, which keys will be added as environment variables to the cronjob. Default: ""
+
+* **logical_backup_successful_jobs_history_limit**
+  number of successful backup jobs to keep in cronjob history. The default is `3`.
+
+* **logical_backup_failed_jobs_history_limit**
+  number of failed backup jobs to keep in cronjob history. The default is `3`.
+
+* **logical_backup_ttl_seconds_after_finished**
+  TTL in seconds after which finished backup jobs are automatically deleted. The default is `86400`.
+
+The following environment variables can be passed to the logical backup
+cronjob via `logical_backup_cronjob_environment_secret` to control
+connectivity checks before the backup starts:
+
+* **LOGICAL_BACKUP_CONNECT_RETRIES**
+  Number of times to retry connecting to the target PostgreSQL pod before
+  giving up. This is useful when NetworkPolicy enforcement introduces a
+  short delay before a newly-created pod's IP is allowed through ingress
+  rules on the destination node. Default: "10"
+
+* **LOGICAL_BACKUP_CONNECT_RETRY_DELAY**
+  Delay in seconds between connectivity retries. Default: "2"
 
 ## Debugging the operator
 
@@ -1077,7 +1098,7 @@ operator being able to provide some reasonable defaults.
 
 * **connection_pooler_image**
   Docker image to use for connection pooler deployment.
-  Default: "registry.opensource.zalan.do/acid/pgbouncer"
+  Default: "ghcr.io/zalando/postgres-operator/pgbouncer:v2.0.1"
 
 * **connection_pooler_max_db_connections**
   How many connections the pooler can max hold. This value is divided among the
